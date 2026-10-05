@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Entorno virtual
+.venv/
+venv/
+env/
+
+# Variables de entorno - NUNCA subir al repo
+.env
+.env.*
+!.env.example
+
+# AWS / SAM
+.aws-sam/
+samconfig.toml
+*.zip
+
+# Editores
+.idea/
+.vscode/
+*.swp
+
+# Node (para el frontend más adelante)
+node_modules/
+.next/
+out/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

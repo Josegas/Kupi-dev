@@ -1,0 +1,10 @@
+<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
+  <rect width="48" height="48" rx="12" fill="#0B0B09"/>
+  <!-- K como paths puros, sin depender de fuentes -->
+  <!-- Trazo vertical izquierdo -->
+  <rect x="12" y="10" width="5" height="28" rx="2" fill="#F5F1EC"/>
+  <!-- Trazo diagonal superior (hacia arriba-derecha) -->
+  <polygon points="17,24 36,10 30,10 14,22.5 14,25.5" fill="#F5F1EC"/>
+  <!-- Trazo diagonal inferior (hacia abajo-derecha) -->
+  <polygon points="17,24 30,38 36,38 17,24 14,22.5 14,25.5" fill="#F5F1EC"/>
+</svg>
