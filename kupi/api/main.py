@@ -328,6 +328,14 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/health/connectors")
+def health_connectors():
+    """Verifica que las cookies/tokens de Rappi y UE sigan funcionando.
+    Envía alerta por email si alguno falla."""
+    from kupi.jobs.health_check import run
+    return run()
+
+
 @app.get("/stores/status")
 def get_stores_status(
     rappi_store_ids: str,
@@ -784,7 +792,7 @@ def get_combined_menu(
             errors.append(f"DiDi: {e}")
 
     if not rappi_products and not ue_products:
-        raise HTTPException(status_code=502, detail={"errors": errors})
+        raise HTTPException(status_code=404, detail="Este restaurante no está disponible en este momento. Puede estar cerrado o fuera de tu zona de cobertura.")
 
     result = _match_products(rappi_products, ue_products)
 
@@ -865,7 +873,7 @@ def compare(request: Request, req: CompareRequest):
             errors.append(f"DiDi: {e}")
 
     if not quotes:
-        raise HTTPException(status_code=502, detail={"errors": errors})
+        raise HTTPException(status_code=404, detail="No se pudo obtener el precio. El restaurante puede estar cerrado en este momento.")
 
     # Filtrar plataformas cerradas/no disponibles si hay al menos una abierta
     open_quotes = [q for q in quotes if q.is_open]
@@ -961,7 +969,7 @@ def compare_cart(request: Request, req: CompareCartRequest):
             errors.append(f"Uber Eats: {e}")
 
     if not quotes:
-        raise HTTPException(status_code=502, detail={"errors": errors})
+        raise HTTPException(status_code=404, detail="No se pudo obtener el precio. El restaurante puede estar cerrado en este momento.")
 
     open_quotes = [q for q in quotes if q.is_open]
     if open_quotes:

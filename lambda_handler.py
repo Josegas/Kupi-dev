@@ -16,6 +16,9 @@ def handler(event, context):
         if job == "sample_prices":
             from kupi.jobs.price_sampler import run
             return run()
+        if job == "health_check":
+            from kupi.jobs.health_check import run
+            return run()
         if job == "warmup":
             return {"status": "warm"}
     # Request HTTP normal (API Gateway / Function URL)

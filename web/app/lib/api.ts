@@ -73,7 +73,13 @@ function parseDetail(detail: unknown, status: number): string {
     const msgs = detail.map((d) => (typeof d?.msg === "string" ? d.msg : JSON.stringify(d)));
     return msgs.join(", ");
   }
-  if (detail && typeof detail === "object") return JSON.stringify(detail);
+  if (detail && typeof detail === "object") {
+    const obj = detail as Record<string, unknown>;
+    if (Array.isArray(obj.errors) && obj.errors.length > 0) {
+      return "Este restaurante no está disponible en este momento.";
+    }
+    return JSON.stringify(detail);
+  }
   return `Error ${status}`;
 }
 

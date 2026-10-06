@@ -39,3 +39,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Perfiles de navegador para rotación de cookies
+scripts/rotate-cookies/.browser-profile/
+scripts/rotate-cookies/.brave-profile/
