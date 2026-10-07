@@ -31,7 +31,6 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 ENV_FILE = PROJECT_ROOT / ".env"
-PROFILE_DIR = SCRIPT_DIR / ".browser-profile"
 
 # URLs
 RAPPI_STORE_URL = "https://www.rappi.com.mx/restaurantes/900022583-little-caesars"
@@ -58,53 +57,55 @@ def _update_env(key: str, value: str) -> bool:
     return True
 
 
-def setup(pw):
-    """Abre los navegadores para que el usuario haga login manual."""
-    print("=== SETUP ===")
-    print("Se abrirán 2 navegadores (uno para cada plataforma).\n")
+# Sin estas, Uber Eats responde "Entrega no disponible" para casi todos los restaurantes.
+# El navegador de Playwright no tiene dirección de entrega guardada, así que se conservan
+# las que ya hay en .env.
+LOCATION_COOKIES = ("uev2.loc", "uev2.diningMode", "user_city_ids")
 
-    # --- Uber Eats: Chromium de Playwright (login con email/password) ---
-    print("--- Uber Eats (Chromium) ---")
-    print("Haz login con email y contraseña. Cierra cuando termines.\n")
-    browser_ue = pw.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_DIR),
-        headless=False,
-        viewport={"width": 1280, "height": 800},
-        locale="es-MX",
-    )
-    page = browser_ue.new_page()
-    page.goto("https://www.ubereats.com/mx")
-    try:
-        page.wait_for_event("close", timeout=0)
-    except Exception:
-        pass
-    try:
-        browser_ue.close()
-    except Exception:
-        pass
-    print("  Sesión de Uber Eats guardada.\n")
 
-    # --- Rappi: Brave real (permite Google OAuth) ---
-    print("--- Rappi (Brave) ---")
-    print("Haz login con Google. Cierra cuando termines.\n")
-    browser_rappi = pw.chromium.launch_persistent_context(
+def _read_env_cookies(key: str) -> dict[str, str]:
+    """Lee un cookie string de .env y lo devuelve como {nombre: valor}."""
+    if not ENV_FILE.exists():
+        return {}
+    for line in ENV_FILE.read_text().splitlines():
+        if line.startswith(f"{key}="):
+            pairs = (p.split("=", 1) for p in line.partition("=")[2].split(";") if "=" in p)
+            return {name.strip(): value.strip() for name, value in pairs}
+    return {}
+
+
+def _launch_brave(pw):
+    # Brave y no el Chromium de Playwright: Google bloquea su login y Cloudflare de Uber Eats
+    # lo detiene en la verificación anti-bots.
+    return pw.chromium.launch_persistent_context(
         executable_path=BRAVE_PATH,
         user_data_dir=str(BRAVE_PROFILE_DIR),
         headless=False,
         viewport={"width": 1280, "height": 800},
         locale="es-MX",
     )
-    page = browser_rappi.new_page()
-    page.goto("https://www.rappi.com.mx")
+
+
+def setup(pw):
+    """Abre Brave con Rappi y Uber Eats para que el usuario inicie sesión en ambos."""
+    print("=== SETUP ===")
+    print("Se abrirá Brave con dos pestañas:")
+    print("  - Rappi: inicia sesión (Google funciona).")
+    print("  - Uber Eats: inicia sesión con la cuenta de Kupi-dev y fija tu dirección de entrega.")
+    print("Cierra el navegador cuando termines.\n")
+
+    browser = _launch_brave(pw)
+    browser.new_page().goto("https://www.rappi.com.mx")
+    page = browser.new_page()
+    page.goto(UBEREATS_URL)
     try:
         page.wait_for_event("close", timeout=0)
     except Exception:
         pass
     try:
-        browser_rappi.close()
+        browser.close()
     except Exception:
         pass
-    print("  Sesión de Rappi guardada.\n")
 
     print("Setup completo. Ahora puedes correr: python rotate.py")
 
@@ -113,13 +114,7 @@ def capture_rappi(pw) -> bool:
     """Captura el Bearer token de Rappi interceptando llamadas a la API."""
     print("\n=== Capturando token de Rappi ===")
 
-    browser = pw.chromium.launch_persistent_context(
-        executable_path=BRAVE_PATH,
-        user_data_dir=str(BRAVE_PROFILE_DIR),
-        headless=False,
-        viewport={"width": 1280, "height": 800},
-        locale="es-MX",
-    )
+    browser = _launch_brave(pw)
 
     page = browser.new_page()
     token_found = None
@@ -173,12 +168,7 @@ def capture_ubereats(pw) -> bool:
     """Captura las cookies de Uber Eats del perfil del navegador."""
     print("\n=== Capturando cookies de Uber Eats ===")
 
-    browser = pw.chromium.launch_persistent_context(
-        user_data_dir=str(PROFILE_DIR),
-        headless=False,
-        viewport={"width": 1280, "height": 800},
-        locale="es-MX",
-    )
+    browser = _launch_brave(pw)
 
     page = browser.new_page()
     print("  Navegando a Uber Eats...")
@@ -204,12 +194,33 @@ def capture_ubereats(pw) -> bool:
     print(f"  Cookies encontradas: {', '.join(sorted(cookie_names))}")
 
     # Verificar que las cookies críticas existan
-    critical = {"jwt-session", "dId"}
+    # `sid` es la sesión iniciada: sin ella los menús cargan pero el checkout (cotizar) falla.
+    critical = {"jwt-session", "dId", "sid"}
     missing = critical - cookie_names
     if missing:
         print(f"  ADVERTENCIA: Faltan cookies críticas: {', '.join(missing)}")
-        print("  Probablemente no tienes sesión activa. Corre: python rotate.py --setup")
+        if "sid" in missing:
+            print("  Sin 'sid' es una sesión de invitado: no sirve para cotizar. NO se modificó el .env.")
+        print("  Hay que iniciar sesión en Uber Eats en el perfil del navegador. Corre: python rotate.py --setup")
         return False
+
+    # Conservar las cookies de ubicación que ya estaban en .env
+    existing = _read_env_cookies("UBEREATS_COOKIE_STRING")
+    preserved = [n for n in LOCATION_COOKIES if n not in cookie_names and n in existing]
+    for name in preserved:
+        cookies.append({"name": name, "value": existing[name]})
+    if preserved:
+        print(f"  Cookies de ubicación conservadas del .env: {', '.join(preserved)}")
+
+    still_missing = [n for n in LOCATION_COOKIES if n not in {c["name"] for c in cookies}]
+    if still_missing:
+        print(f"  ADVERTENCIA: sin cookies de ubicación ({', '.join(still_missing)}).")
+        print("  Uber Eats marcará casi todos los restaurantes como 'Entrega no disponible'.")
+        print("  Abre ubereats.com en el perfil de Playwright y fija tu dirección de entrega.")
+
+    # cf_clearance queda atada a la huella del navegador que la obtuvo; con la huella del
+    # conector Cloudflare la rechaza y Uber Eats responde 403.
+    cookies = [c for c in cookies if c["name"] != "cf_clearance"]
 
     # Construir cookie string en el mismo formato que usa el .env
     cookie_string = "; ".join(f"{c['name']}={c['value']}" for c in cookies)

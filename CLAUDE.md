@@ -6,7 +6,8 @@ Metabuscador de precios de comida a domicilio (Rappi, Uber Eats, DiDi Food) en M
 ## Contexto del proyecto
 - Kupi nació en el hackathon **AWS "Zero to Shipped"** (18 sept – 2 oct 2026). El hackathon ya se entregó, está desplegado en AWS con URL pública y cumple todos los requisitos del hackathon. Actualmente en revisión por los jueces.
 - **Este repo (`Kupi-dev`)** es el repo de **desarrollo activo**, creado el 4 de octubre de 2026 para continuar construyendo el producto con features nuevas, mejoras y evolución del código sin afectar la entrega del hackathon.
-- **El repo original (`Kupi`, github: Josegas/Kupi)** se usa solo para **mantenimiento operativo**: corregir bugs, rotar cookies/tokens, ajustes mínimos para mantener el producto funcionando. No se desarrollan features nuevas ahí — está en revisión por los jueces del hackathon.
+- **El repo original (`Kupi`, github: Josegas/Kupi) está congelado**: está en revisión por los jueces del hackathon y lo entregado se queda tal cual. No se modifica nada ahí, ni siquiera fixes de bugs. Todo cambio se hace solo en `Kupi-dev`.
+- Kupi-dev tampoco debe compartir estado con el desplegado: nada de copiar cookies/sesiones del `.env` del repo original (comparten la misma cuenta de Uber Eats y las pruebas locales llenan su tope de carritos).
 - El proyecto tiene intención real de crecer como producto más allá del hackathon - la arquitectura se decidió pensando en esa escala futura.
 
 ---
@@ -20,7 +21,7 @@ Metabuscador de precios de comida a domicilio (Rappi, Uber Eats, DiDi Food) en M
 
 ---
 
-## Estado actual del proyecto (actualizado 5 oct 2026)
+## Estado actual del proyecto (actualizado 7 oct 2026)
 
 ### Lo que ya funciona end-to-end
 
@@ -38,6 +39,8 @@ Metabuscador de precios de comida a domicilio (Rappi, Uber Eats, DiDi Food) en M
 - Búsqueda de restaurantes con filtros por categoría y plataforma
 - Comparación dinámica de precios entre plataformas
 - Carrito multi-producto: contexto con validación de plataformas en común (cart.tsx), CartBar con UI expandible, comparación integrada en CompareClient.tsx, límite de 10 items, conectado al endpoint `/compare-cart`
+- Menú del restaurante (CompareClient.tsx): los filtros de plataforma (Todo / Ambas apps / Solo Rappi / Solo Uber Eats) y las etiquetas "Solo X" solo aparecen si el menú trae productos de las dos apps; se ocultan los filtros sin productos. Si solo hay una app, el subtítulo dice "En tu zona este restaurante solo está disponible en X".
+- Errores de `/compare`, `/compare-cart` y `/menu/combined`: 404 con mensaje legible en vez de 502 con JSON técnico
 - Sistema de favoritos con historial de precios y alertas
 - Página de deals (productos baratos verificados con checkout completo)
 - Página de cupones
@@ -57,7 +60,7 @@ Metabuscador de precios de comida a domicilio (Rappi, Uber Eats, DiDi Food) en M
 **Herramientas de mantenimiento (scripts/):**
 - `check-tokens.sh` — muestra estado y expiración de tokens/cookies (decodifica JWT de UE, prueba llamada real a Rappi)
 - `rotate-rappi-token.sh` — sube token de .env a Parameter Store y reinicia Lambda
-- `rotate-cookies/rotate.py` — script con Playwright que captura cookies/tokens automáticamente desde el navegador y actualiza .env. Usa Brave para Rappi (Google OAuth) y Chromium para UE (email/password). Perfiles persistentes: no requiere login cada vez, solo `python rotate.py`
+- `rotate-cookies/rotate.py` — script con Playwright que captura cookies/tokens automáticamente desde el navegador y actualiza .env. Usa Brave para ambas plataformas, con perfil persistente: no requiere login cada vez, solo `python rotate.py`
 
 **Despliegue:**
 - Backend: AWS Lambda + Function URL (sin API Gateway) + Mangum
@@ -77,6 +80,10 @@ Metabuscador de precios de comida a domicilio (Rappi, Uber Eats, DiDi Food) en M
 2. **Dominio propio** — Namecheap con GitHub Student Pack.
 3. **Experimento de precios dinámicos** — Muestreo intensivo (15-20 productos cada 5 min, 48-72h) para detectar patrones.
 4. **Configurar EventBridge para health check** — Cuando Kupi-dev tenga su propia Lambda, crear regla EventBridge con `{"job": "health_check"}` cada 4-6 horas (solo aplica a la infra de Kupi-dev, no tocar la del hackathon).
+5. **Ofertas del canal de WhatsApp de Rappi** (pendiente desde 6 oct 2026) — El canal "Rappi México" (`https://www.whatsapp.com/channel/0029Vavdy1EBFLga5N5T5d1J`) publica promos de precio por tiempo limitado, no códigos (ej. "Caffenio: Mexicano Caliente — $19" + enlace `rappi.sng.link` que en web solo abre el inicio de Rappi). Las publicaciones no son públicas: requieren entrar a WhatsApp.
+   - **Siguiente paso:** cuando el usuario pase una promo **activa**, revisar en ese momento si Rappi marca el producto en sus propios datos (`real_price` > `price` o `discounts[]` en `store/id`). Las promos caducan, así que no sirve revisar una vieja.
+   - Si Rappi la marca → detectar y publicar promos directo desde los datos de Rappi (sin WhatsApp).
+   - Si no → script local con Playwright + número dedicado leyendo WhatsApp Web, parseo con reglas (tienda, producto, precio). Riesgo: va contra los términos de WhatsApp (baneo del número) y se rompe con cambios de la página. Extraer con IA tendría costo (choca con presupuesto $0).
 
 ---
 
@@ -90,7 +97,11 @@ Metabuscador de precios de comida a domicilio (Rappi, Uber Eats, DiDi Food) en M
 ### Uber Eats
 - **Qué se necesita**: Cookie string completo (`UBEREATS_COOKIE_STRING`) con `dId`, `jwt-session`, `uev2.id.session_v2`, etc.
 - **Dónde se guarda**: `.env` (local), Parameter Store en 2 partes `/kupi/ubereats-cookie-1` + `/kupi/ubereats-cookie-2` (Lambda)
-- **Cómo se rota**: `python scripts/rotate-cookies/rotate.py --ubereats` (abre Chromium con perfil persistente, captura cookies automáticamente, actualiza .env). Luego `bash scripts/deploy.sh` para subir a Parameter Store.
+- **Cuenta**: Kupi-dev usa su **propia cuenta de Uber Eats** (correo y contraseña), distinta a la del desplegado. Nunca copiar cookies/`sid` del `.env` del repo original.
+- **Cómo se rota**: `python scripts/rotate-cookies/rotate.py --ubereats` (abre Brave con perfil persistente, captura cookies automáticamente, actualiza .env). Luego `bash scripts/deploy.sh` para subir a Parameter Store.
+- **Cookies que importan**: `sid` (sesión iniciada; sin ella los menús cargan pero cotizar falla — el script no toca el .env si falta), `uev2.loc` / `uev2.diningMode` / `user_city_ids` (ubicación; sin ellas casi todo sale "Entrega no disponible" — el script las conserva del .env si el navegador no las trae). `cf_clearance` se descarta: está atada a la huella del navegador y con la del conector da 403.
+- **La expiración del JWT no es la señal para rotar**: `check-tokens.sh` puede decir "EXPIRADO" mientras Uber Eats sigue aceptando las cookies. Rotar solo cuando falle el health check.
+- **Borradores (draft orders)**: cada cotización crea un borrador en la cuenta; Uber Eats limita cuántos puede haber ("Demasiados carritos"). El conector los borra con `discardDraftOrdersV1` después de cotizar (`fetch_price` y `fetch_cart_price`). El desplegado (congelado) no los borra: si ahí sale "Demasiados carritos", hay que vaciar carritos a mano en el navegador de esa cuenta.
 - **Mitigación**: Worker de Cloudflare como proxy alternativo + curl_cffi con impersonate="chrome120"
 
 ### Flujo de rotación completo
@@ -104,7 +115,7 @@ Metabuscador de precios de comida a domicilio (Rappi, Uber Eats, DiDi Food) en M
 pip install playwright && playwright install chromium
 python scripts/rotate-cookies/rotate.py --setup
 ```
-Abre Chromium para UE (login con email/password) y Brave para Rappi (login con Google OAuth). Las sesiones quedan guardadas en perfiles locales.
+Abre Brave con dos pestañas: Rappi (login con Google) y Uber Eats (login con la cuenta de Kupi-dev + fijar dirección de entrega en Culiacán). Las sesiones quedan en el perfil local `scripts/rotate-cookies/.brave-profile/`. Se usa Brave y no el Chromium de Playwright porque Google bloquea su login y Cloudflare de Uber Eats lo detiene en la verificación anti-bots.
 
 ---
 

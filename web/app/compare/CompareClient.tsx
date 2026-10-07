@@ -274,6 +274,14 @@ export default function CompareClient({ restaurant }: Props) {
     return matchesSearch && matchesPlatform && matchesFav;
   });
 
+  const platformCounts = {
+    all: allProducts.length,
+    both: allProducts.filter((p) => !p.exclusivePlatform).length,
+    rappi: allProducts.filter((p) => p.exclusivePlatform === "rappi").length,
+    ubereats: allProducts.filter((p) => p.exclusivePlatform === "ubereats").length,
+  };
+  const showPlatformFilters = availablePlatforms.rappi && availablePlatforms.ubereats;
+
   const cheapest = quotes[0] ?? null;
 
   // ── Header compartido ──────────────────────────────────────────────
@@ -411,18 +419,23 @@ export default function CompareClient({ restaurant }: Props) {
             {t.compare.selectTitle}
           </h2>
           <p className="text-[13px] text-[var(--text-muted)] mb-6">
-            {t.compare.selectSubtitle}
+            {!loadingMenu && availablePlatforms.rappi !== availablePlatforms.ubereats
+              ? t.compare.selectSubtitleSingle.replace(
+                  "{platform}",
+                  availablePlatforms.rappi ? "Rappi" : "Uber Eats",
+                )
+              : t.compare.selectSubtitle}
           </p>
 
           {/* Filtros de plataforma */}
-          {!loadingMenu && !menuError && allProducts.length > 0 && (
+          {!loadingMenu && !menuError && allProducts.length > 0 && (showPlatformFilters || (user && favProductIds.size > 0)) && (
             <div className="flex gap-2 flex-wrap mb-4">
-              {([
+              {showPlatformFilters && ([
                 { key: "all",      label: "Todo" },
                 { key: "both",     label: "Ambas apps" },
                 { key: "rappi",    label: "Solo Rappi" },
                 { key: "ubereats", label: "Solo Uber Eats" },
-              ] as const).map(({ key, label }) => (
+              ] as const).filter(({ key }) => platformCounts[key] > 0).map(({ key, label }) => (
                 <button
                   key={key}
                   onClick={() => setPlatformFilter(key)}
@@ -535,7 +548,7 @@ export default function CompareClient({ restaurant }: Props) {
                       {/* Info */}
                       <div className="p-3">
                         <p className="text-[13px] font-semibold text-[var(--text-primary)] leading-tight line-clamp-2 mb-1">{p.name}</p>
-                        {p.exclusivePlatform && (
+                        {p.exclusivePlatform && showPlatformFilters && (
                           <span
                             className="inline-block text-[10px] font-bold px-1.5 py-0.5 rounded-full mb-1"
                             style={{ background: PLATFORM_COLORS[p.exclusivePlatform] + "22", color: PLATFORM_COLORS[p.exclusivePlatform] }}

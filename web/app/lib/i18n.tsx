@@ -41,7 +41,8 @@ export const T = {
     },
     compare: {
       selectTitle: "¿Qué quieres comparar?",
-      selectSubtitle: "Solo se muestran productos disponibles en Rappi y Uber Eats.",
+      selectSubtitle: "Productos de Rappi y Uber Eats. Los que están en ambas apps se pueden comparar.",
+      selectSubtitleSingle: "En tu zona este restaurante solo está disponible en {platform}.",
       searchPlaceholder: "Buscar producto…",
       retry: "Reintentar",
       noImage: "Sin imagen",
@@ -151,7 +152,8 @@ export const T = {
     },
     compare: {
       selectTitle: "What do you want to compare?",
-      selectSubtitle: "Only products available on Rappi and Uber Eats are shown.",
+      selectSubtitle: "Products from Rappi and Uber Eats. Those on both apps can be compared.",
+      selectSubtitleSingle: "In your area this restaurant is only available on {platform}.",
       searchPlaceholder: "Search product…",
       retry: "Retry",
       noImage: "No image",

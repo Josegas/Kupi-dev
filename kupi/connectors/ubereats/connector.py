@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import urllib.parse
 import uuid as uuid_lib
@@ -7,6 +8,8 @@ from curl_cffi import requests
 from kupi.connectors.base import BaseConnector
 from kupi.core.config import UBEREATS_COOKIE_STRING
 from kupi.core.models import Product, PriceQuote, CartItemDetail
+
+logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://www.ubereats.com/_p/api"
 _WORKER_URL = os.getenv("UBEREATS_WORKER_URL", "")
@@ -131,6 +134,18 @@ def _call_ubereats(url: str, headers: dict, body: dict) -> dict:
         return resp.json()
 
 
+def _discard_draft(draft_order_uuid: str, store_id: str, lat: float, lng: float) -> None:
+    """Borra el draft order: Uber Eats limita cuántos carritos abiertos tiene una cuenta."""
+    try:
+        _call_ubereats(
+            f"{_BASE_URL}/discardDraftOrdersV1?localeCode=mx",
+            _build_headers(lat, lng),
+            {"draftOrderUUIDs": [draft_order_uuid], "storeUUID": store_id},
+        )
+    except Exception as e:
+        logger.warning("No se pudo borrar el draft %s: %s", draft_order_uuid, e)
+
+
 class UberEatsConnector(BaseConnector):
 
     def fetch_menu(self, store_id: str, lat: float, lng: float) -> list[Product]:
@@ -252,7 +267,10 @@ class UberEatsConnector(BaseConnector):
                 "versionMetadata",
             ],
         }
-        data2 = _call_ubereats(f"{_BASE_URL}/getCheckoutPresentationV1?localeCode=mx", _build_headers(lat, lng, referer), checkout_body)
+        try:
+            data2 = _call_ubereats(f"{_BASE_URL}/getCheckoutPresentationV1?localeCode=mx", _build_headers(lat, lng, referer), checkout_body)
+        finally:
+            _discard_draft(draft_order_uuid, store_id, lat, lng)
         if data2.get("status") != "success":
             raise RuntimeError(f"getCheckoutPresentationV1 falló: {data2}")
 
@@ -353,7 +371,10 @@ class UberEatsConnector(BaseConnector):
                 "versionMetadata",
             ],
         }
-        data2 = _call_ubereats(f"{_BASE_URL}/getCheckoutPresentationV1?localeCode=mx", _build_headers(lat, lng, referer), checkout_body)
+        try:
+            data2 = _call_ubereats(f"{_BASE_URL}/getCheckoutPresentationV1?localeCode=mx", _build_headers(lat, lng, referer), checkout_body)
+        finally:
+            _discard_draft(draft_order_uuid, store_id, lat, lng)
         if data2.get("status") != "success":
             raise RuntimeError(f"getCheckoutPresentationV1 cart falló: {data2}")
 
