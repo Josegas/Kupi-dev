@@ -175,6 +175,7 @@ export interface SearchResult {
   eta_preview: string;
   rating: string;
   matching_products: MatchingProduct[];
+  is_open?: boolean; // false = no disponible (cerrado o fuera de cobertura)
 }
 
 export async function searchRestaurants(q: string, lat: number, lng: number): Promise<SearchResult[]> {

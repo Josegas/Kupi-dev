@@ -1440,7 +1440,79 @@ def _do_search(q: str, lat: float, lng: float) -> list[dict]:
 
     threading.Thread(target=_save_to_db, daemon=True).start()
 
+    # Disponibilidad: marcar is_open por resultado (con ambas apps, requiere ambas).
+    # Evita que el usuario entre a un restaurante que luego falla al comparar.
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {
+            ex.submit(_store_available, r.get("rappi_store_id"), r.get("ubereats_store_id"), lat, lng): r
+            for r in merged
+        }
+        for f in futs:
+            try:
+                futs[f]["is_open"] = f.result()
+            except Exception:
+                futs[f]["is_open"] = True  # optimista si falla el chequeo
+
     return merged
+
+
+def _store_ue_open(ue_id: str, lat: float, lng: float) -> bool:
+    """UberEats disponible en esta zona. Optimista ante errores de red. Cacheado."""
+    from kupi.connectors.ubereats.connector import _call_ubereats, _build_headers, _BASE_URL
+    k = f"ue_open_{ue_id}_{round(lat,2)}_{round(lng,2)}"
+    with _cache_lock:
+        c = _status_cache.get(k)
+    if c is not None:
+        return c
+    v = True
+    try:
+        body = {"storeUuid": ue_id, "diningMode": "DELIVERY", "time": {"asap": True}, "cbType": "EATER_ENDORSED"}
+        data = _call_ubereats(f"{_BASE_URL}/getStoreV1?localeCode=mx", _build_headers(lat, lng), body).get("data", {})
+        v = not data.get("closedMessage", "")
+        with _cache_lock:
+            _status_cache[k] = v
+    except Exception:
+        pass
+    return v
+
+
+def _store_rappi_open(rappi_id: str, lat: float, lng: float) -> bool:
+    """Rappi disponible/en cobertura en esta zona. OUT_OF_COVERAGE/CLOSED y errores
+    4xx (p.ej. 404: la tienda no se puede servir) marcan NO disponible. Solo los
+    errores transitorios (timeout, 5xx) quedan optimistas para no ocultar de más. Cacheado."""
+    k = f"rp_open_{rappi_id}_{round(lat,2)}_{round(lng,2)}"
+    with _cache_lock:
+        c = _status_cache.get(k)
+    if c is not None:
+        return c
+    v = True
+    try:
+        data = rappi._fetch_store(rappi_id, lat, lng)
+        v = data.get("status") == "OPEN"
+        with _cache_lock:
+            _status_cache[k] = v
+    except _requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 0
+        if 400 <= status < 500:
+            v = False  # error permanente de la tienda → no disponible
+            with _cache_lock:
+                _status_cache[k] = v
+        # 5xx: transitorio, no cachear, quedar optimista
+    except Exception:
+        pass  # red/timeout: optimista, sin cachear
+    return v
+
+
+def _store_available(rappi_id, ue_id, lat: float, lng: float) -> bool:
+    """Disponible para comparar. Con ambas apps, requiere que AMBAS lo estén
+    (evita mostrar como clickeable un restaurante que luego falla al comparar)."""
+    if ue_id and rappi_id:
+        return _store_ue_open(ue_id, lat, lng) and _store_rappi_open(rappi_id, lat, lng)
+    if ue_id:
+        return _store_ue_open(ue_id, lat, lng)
+    if rappi_id:
+        return _store_rappi_open(rappi_id, lat, lng)
+    return True
 
 
 @app.get("/restaurants/popular")
@@ -1451,11 +1523,9 @@ def get_popular_restaurants(
     """
     Restaurantes populares desde Supabase con status abierto/cerrado en tiempo real.
     Prioriza restaurantes con ambas plataformas e imagen.
-    UberEats como fuente de verdad para horarios.
-    Cache de 5 min.
+    Con ambas apps, solo se marca disponible si AMBAS lo están. Cache de 5 min.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from kupi.connectors.ubereats.connector import _call_ubereats, _build_headers, _BASE_URL
 
     # Cache por ubicación (redondeada a 1 decimal ~11km) para no servir Culiacán a alguien en Veracruz
     cache_key = f"popular_{round(lat,1)}_{round(lng,1)}"
@@ -1483,37 +1553,7 @@ def get_popular_restaurants(
     candidates = filtered[:50]  # Limitar para no saturar APIs
 
     def check_status(r: dict) -> dict:
-        is_open = True  # optimista por defecto
-        ue_id = r.get("ubereats_store_id")
-        rappi_id = r.get("rappi_store_id")
-
-        # Revisar cache (TTLCache maneja expiración automáticamente)
-        cache_key = ue_id or rappi_id or ""
-        with _cache_lock:
-            cached_status = _status_cache.get(cache_key)
-        if cached_status is not None:
-            is_open = cached_status
-        elif ue_id:
-            # UberEats como fuente de verdad
-            try:
-                headers = _build_headers(lat, lng)
-                body = {"storeUuid": ue_id, "diningMode": "DELIVERY", "time": {"asap": True}, "cbType": "EATER_ENDORSED"}
-                data = _call_ubereats(f"{_BASE_URL}/getStoreV1?localeCode=mx", headers, body).get("data", {})
-                is_open = not data.get("closedMessage", "")
-                with _cache_lock:
-                    _status_cache[cache_key] = is_open
-            except Exception:
-                pass
-        elif rappi_id:
-            # Fallback: Rappi
-            try:
-                data = rappi._fetch_store(rappi_id, lat, lng)
-                is_open = data.get("status") == "OPEN"
-                with _cache_lock:
-                    _status_cache[cache_key] = is_open
-            except Exception:
-                pass
-
+        is_open = _store_available(r.get("rappi_store_id"), r.get("ubereats_store_id"), lat, lng)
         return {
             "restaurant_name": _fix_restaurant_name(r.get("name", "")),
             "rappi_store_id": r.get("rappi_store_id"),

@@ -226,71 +226,95 @@ export default function Buscar() {
                   const hasUE = !!r.ubereats_store_id;
                   const products = r.matching_products || [];
                   const href = buildHref(r);
+                  const closed = r.is_open === false;
                   return (
-                    <div key={`${r.rappi_store_id}-${r.ubereats_store_id}-${i}`} className="stagger-item" style={{ animationDelay: `${100 + i * 40}ms` }}>
+                    <div key={`${r.rappi_store_id}-${r.ubereats_store_id}-${i}`} className={`stagger-item ${closed ? "opacity-50" : ""}`} style={{ animationDelay: `${100 + i * 40}ms` }}>
                       {/* Restaurant header */}
-                      <a href={href} className="flex items-center gap-3 mb-3 group">
-                        <div className="w-10 h-10 rounded-full bg-[var(--bg)] overflow-hidden shrink-0 border border-[var(--border)]">
-                          {r.image_url ? (
-                            <img src={proxyImage(r.image_url)} alt={r.restaurant_name} className="w-full h-full object-cover" />
-                          ) : (
-                            <div className="w-full h-full flex items-center justify-center text-[10px] text-[var(--text-muted)]">?</div>
-                          )}
-                        </div>
-                        <div className="min-w-0">
-                          <h3 className="text-[15px] font-semibold text-[var(--text-primary)] group-hover:text-[var(--brand)] transition-colors truncate">
-                            {r.restaurant_name}
-                          </h3>
-                          <div className="flex items-center gap-2 text-[12px] text-[var(--text-muted)]">
-                            {hasR && hasUE ? (
-                              <span className="text-[var(--brand)] font-medium">Rappi · Uber Eats</span>
-                            ) : hasR ? (
-                              <span style={{ color: "#FF441F" }} className="font-medium">Rappi</span>
+                      {closed ? (
+                        <div className="flex items-center gap-3 mb-3 cursor-default">
+                          <div className="w-10 h-10 rounded-full bg-[var(--bg)] overflow-hidden shrink-0 border border-[var(--border)]">
+                            {r.image_url ? (
+                              <img src={proxyImage(r.image_url)} alt={r.restaurant_name} className="w-full h-full object-cover" />
                             ) : (
-                              <span style={{ color: "#06C167" }} className="font-medium">Uber Eats</span>
+                              <div className="w-full h-full flex items-center justify-center text-[10px] text-[var(--text-muted)]">?</div>
                             )}
-                            {r.eta_preview && <><span>·</span><span>{r.eta_preview}</span></>}
-                            {r.delivery_fee_preview && <><span>·</span><span>Envio {r.delivery_fee_preview}</span></>}
+                          </div>
+                          <div className="min-w-0">
+                            <h3 className="text-[15px] font-semibold text-[var(--text-primary)] truncate">{r.restaurant_name}</h3>
+                            <div className="text-[12px] text-[var(--text-muted)]">No disponible ahora</div>
                           </div>
                         </div>
-                      </a>
+                      ) : (
+                        <a href={href} className="flex items-center gap-3 mb-3 group">
+                          <div className="w-10 h-10 rounded-full bg-[var(--bg)] overflow-hidden shrink-0 border border-[var(--border)]">
+                            {r.image_url ? (
+                              <img src={proxyImage(r.image_url)} alt={r.restaurant_name} className="w-full h-full object-cover" />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center text-[10px] text-[var(--text-muted)]">?</div>
+                            )}
+                          </div>
+                          <div className="min-w-0">
+                            <h3 className="text-[15px] font-semibold text-[var(--text-primary)] group-hover:text-[var(--brand)] transition-colors truncate">
+                              {r.restaurant_name}
+                            </h3>
+                            <div className="flex items-center gap-2 text-[12px] text-[var(--text-muted)]">
+                              {hasR && hasUE ? (
+                                <span className="text-[var(--brand)] font-medium">Rappi · Uber Eats</span>
+                              ) : hasR ? (
+                                <span style={{ color: "#FF441F" }} className="font-medium">Rappi</span>
+                              ) : (
+                                <span style={{ color: "#06C167" }} className="font-medium">Uber Eats</span>
+                              )}
+                              {r.eta_preview && <><span>·</span><span>{r.eta_preview}</span></>}
+                              {r.delivery_fee_preview && <><span>·</span><span>Envio {r.delivery_fee_preview}</span></>}
+                            </div>
+                          </div>
+                        </a>
+                      )}
 
                       {/* Matching products */}
                       {products.length > 0 ? (
                         <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-hide pl-[52px]">
-                          {products.slice(0, 6).map((p, j) => (
-                            <a
-                              key={`${p.product_id}-${j}`}
-                              href={href}
-                              className="shrink-0 w-36 bg-[var(--surface)] border border-[var(--border)] rounded-xl overflow-hidden kupi-card"
-                            >
-                              <div className="h-24 bg-[var(--bg)] overflow-hidden">
-                                {p.image_url ? (
-                                  <img
-                                    src={proxyImage(p.image_url)}
-                                    alt={p.name}
-                                    loading="lazy"
-                                    className="w-full h-full object-cover"
-                                    onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
-                                  />
-                                ) : (
-                                  <div className="w-full h-full flex items-center justify-center text-[var(--text-muted)] text-[10px]">Sin imagen</div>
-                                )}
+                          {products.slice(0, 6).map((p, j) => {
+                            const cardInner = (
+                              <>
+                                <div className="h-24 bg-[var(--bg)] overflow-hidden">
+                                  {p.image_url ? (
+                                    <img
+                                      src={proxyImage(p.image_url)}
+                                      alt={p.name}
+                                      loading="lazy"
+                                      className="w-full h-full object-cover"
+                                      onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                                    />
+                                  ) : (
+                                    <div className="w-full h-full flex items-center justify-center text-[var(--text-muted)] text-[10px]">Sin imagen</div>
+                                  )}
+                                </div>
+                                <div className="p-2">
+                                  <p className="text-[12px] font-medium text-[var(--text-primary)] leading-tight line-clamp-2 mb-0.5">{p.name}</p>
+                                  <p className="text-[13px] font-bold text-[var(--savings)]">${p.price.toFixed(0)}</p>
+                                </div>
+                              </>
+                            );
+                            return closed ? (
+                              <div key={`${p.product_id}-${j}`} className="shrink-0 w-36 bg-[var(--surface)] border border-[var(--border)] rounded-xl overflow-hidden cursor-default">
+                                {cardInner}
                               </div>
-                              <div className="p-2">
-                                <p className="text-[12px] font-medium text-[var(--text-primary)] leading-tight line-clamp-2 mb-0.5">{p.name}</p>
-                                <p className="text-[13px] font-bold text-[var(--savings)]">${p.price.toFixed(0)}</p>
-                              </div>
-                            </a>
-                          ))}
+                            ) : (
+                              <a key={`${p.product_id}-${j}`} href={href} className="shrink-0 w-36 bg-[var(--surface)] border border-[var(--border)] rounded-xl overflow-hidden kupi-card">
+                                {cardInner}
+                              </a>
+                            );
+                          })}
                         </div>
-                      ) : (
+                      ) : !closed ? (
                         <a href={href} className="pl-[52px] block">
                           <span className="text-[13px] text-[var(--text-muted)] hover:text-[var(--brand)] transition-colors">
                             Ver menu completo →
                           </span>
                         </a>
-                      )}
+                      ) : null}
 
                       {/* Divider */}
                       {i < filteredSearch.length - 1 && (
