@@ -7,12 +7,8 @@ interface Location {
   label: string;
 }
 
-// Default: Culiacán centro (donde tenemos la mayor cobertura de restaurantes)
-const FALLBACK_LOCATION: Location = {
-  lat: 24.8069,
-  lng: -107.3940,
-  label: "Culiacán, Sinaloa",
-};
+// Sin ubicación todavía: hasLocation=false y las páginas no consultan hasta que haya una
+const FALLBACK_LOCATION: Location = { lat: 0, lng: 0, label: "" };
 
 interface LocationContextType {
   location: Location;
@@ -28,9 +24,10 @@ const LocationContext = createContext<LocationContextType>({
 
 export function LocationProvider({ children }: { children: ReactNode }) {
   const [location, setLocationState] = useState<Location>(FALLBACK_LOCATION);
-  const [hasLocation, setHasLocation] = useState(true); // default a Culiacán ya tiene datos
+  const [hasLocation, setHasLocation] = useState(false);
 
-  // Restaurar ubicación guardada al montar
+  // Restaurar ubicación guardada al montar; si no hay, pedirla al navegador.
+  // Si el usuario la rechaza, se queda sin ubicación y la escribe en la barra de arriba.
   useEffect(() => {
     try {
       const saved = localStorage.getItem("kupi-location");
@@ -39,9 +36,18 @@ export function LocationProvider({ children }: { children: ReactNode }) {
         if (parsed.lat && parsed.lng && parsed.label) {
           setLocationState(parsed);
           setHasLocation(true);
+          return;
         }
       }
     } catch { /* ignore */ }
+    navigator.geolocation?.getCurrentPosition(
+      async ({ coords }) => {
+        const label = await reverseGeocode(coords.latitude, coords.longitude);
+        setLocation({ lat: coords.latitude, lng: coords.longitude, label });
+      },
+      () => { /* rechazada: el usuario escribe su dirección */ },
+      { enableHighAccuracy: true, timeout: 10000 },
+    );
   }, []);
 
   const setLocation = (loc: Location) => {
@@ -66,6 +72,22 @@ export interface GeoSuggestion {
   lng: number;
   label: string;
   fullLabel: string;
+}
+
+async function reverseGeocode(lat: number, lng: number): Promise<string> {
+  const params = new URLSearchParams({ lat: String(lat), lon: String(lng), format: "json", addressdetails: "1" });
+  try {
+    const res = await fetch(`https://nominatim.openstreetmap.org/reverse?${params}`, {
+      headers: { "Accept-Language": "es", "User-Agent": "Kupi/1.0" },
+    });
+    const r = await res.json();
+    // Calle, colonia y ciudad (display_name empieza con el negocio más cercano, ej. una óptica)
+    const a = r.address ?? {};
+    const parts = [a.road, a.neighbourhood ?? a.suburb, a.city ?? a.town ?? a.village].filter(Boolean);
+    if (parts.length) return parts.join(", ");
+    if (r.display_name) return r.display_name.split(",").slice(0, 3).join(",");
+  } catch { /* ignore */ }
+  return "Mi ubicación";
 }
 
 export async function searchAddress(query: string): Promise<GeoSuggestion[]> {

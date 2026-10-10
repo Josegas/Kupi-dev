@@ -17,6 +17,8 @@ class FavoriteCreate(BaseModel):
     rappi_store_id: str | None = None
     ubereats_store_id: str | None = None
     image_url: str = ""
+    lat: float | None = None
+    lng: float | None = None
 
 
 @router.get("")
@@ -38,6 +40,8 @@ def add_favorite(body: FavoriteCreate, user: dict = Depends(get_current_user)):
         "rappi_store_id": body.rappi_store_id,
         "ubereats_store_id": body.ubereats_store_id,
         "image_url": body.image_url,
+        "lat": body.lat,
+        "lng": body.lng,
     }
     try:
         resp = sb.table("user_favorites").insert(row).execute()
@@ -77,35 +81,17 @@ def get_price_history(favorite_id: int, days: int = 30, user: dict = Depends(get
     if not rappi_pid and not ue_pid:
         return []
 
-    # Buscar snapshots de los últimos N días
+    # Snapshots de los últimos N días, medidos en la zona del usuario (el envío depende de eso)
     from datetime import datetime, timedelta, timezone
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
-    query = sb.table("price_snapshots").select("*").gte("sampled_at", since).order("sampled_at", desc=False)
+    def snapshots(column: str, product_id: str) -> list[dict]:
+        query = sb.table("price_snapshots").select("*").eq(column, product_id).gte("sampled_at", since)
+        if fav.get("lat") is not None and fav.get("lng") is not None:
+            query = query.eq("lat", round(fav["lat"], 2)).eq("lng", round(fav["lng"], 2))
+        return query.order("sampled_at", desc=False).execute().data or []
 
-    # Filtrar por product IDs
-    if rappi_pid and ue_pid:
-        # Buscar snapshots que coincidan con cualquiera de los dos IDs
-        snapshots_rappi = (
-            sb.table("price_snapshots").select("*")
-            .eq("rappi_product_id", rappi_pid)
-            .gte("sampled_at", since)
-            .order("sampled_at", desc=False)
-            .execute()
-        )
-        snapshots_ue = (
-            sb.table("price_snapshots").select("*")
-            .eq("ubereats_product_id", ue_pid)
-            .gte("sampled_at", since)
-            .order("sampled_at", desc=False)
-            .execute()
-        )
-        all_snapshots = (snapshots_rappi.data or []) + (snapshots_ue.data or [])
-        all_snapshots.sort(key=lambda s: s.get("sampled_at", ""))
-        return all_snapshots
-    elif rappi_pid:
-        resp = query.eq("rappi_product_id", rappi_pid).execute()
-    else:
-        resp = query.eq("ubereats_product_id", ue_pid).execute()
-
-    return resp.data or []
+    # Un snapshot de Rappi y otro de Uber Eats del mismo muestreo comparten ambos ids: evitar duplicados
+    by_id = {s["id"]: s for s in (snapshots("rappi_product_id", rappi_pid) if rappi_pid else [])}
+    by_id.update({s["id"]: s for s in (snapshots("ubereats_product_id", ue_pid) if ue_pid else [])})
+    return sorted(by_id.values(), key=lambda s: s.get("sampled_at", ""))

@@ -4,6 +4,7 @@ import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
 import TopNav from "../components/TopNav";
 import { fetchDeals, DealProduct, proxyImage } from "../lib/api";
+import { useLocation } from "../lib/location";
 
 const CATEGORIES = ["Pizza", "Pollo", "Sushi", "Hamburguesas", "Tacos", "Café"];
 
@@ -20,16 +21,17 @@ export default function Deals() {
   const [category, setCategory] = useState<string | null>(null);
   const [products, setProducts] = useState<DealProduct[]>([]);
   const [loading, setLoading] = useState(false);
+  const { location, hasLocation } = useLocation();
 
   useEffect(() => {
-    if (!category) return;
+    if (!category || !hasLocation) return;
     setProducts([]);
     setLoading(true);
-    fetchDeals(category, 100)
+    fetchDeals(category, location.lat, location.lng, 100)
       .then(data => setProducts(data))
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [category]);
+  }, [category, location, hasLocation]);
 
   return (
     <div className="min-h-screen bg-[var(--bg)] transition-colors duration-300">
@@ -52,7 +54,7 @@ export default function Deals() {
             Menos de $100
           </h1>
           <p className="text-[15px] text-[var(--text-secondary)]">
-            Precio total verificado (producto + envío + cuota) en Rappi y Uber Eats.
+            Productos cerca de ti en Rappi y Uber Eats, con las ofertas primero. Al abrir uno ves el total exacto con envío y cuota.
           </p>
         </div>
 
@@ -80,7 +82,7 @@ export default function Deals() {
               Selecciona una categoría para ver productos por menos de $100
             </p>
             <p className="text-[13px] text-[var(--text-muted)] mt-2">
-              El precio incluye envío y cuota de servicio, verificado en tiempo real.
+              Al abrir un producto ves el total exacto con envío y cuota en ambas apps.
             </p>
           </div>
         )}
@@ -89,7 +91,7 @@ export default function Deals() {
         {loading && (
           <>
             <p className="text-[13px] text-[var(--text-muted)] mb-5">
-              Verificando precios con envío en Rappi y Uber Eats...
+              Buscando productos en Rappi y Uber Eats cerca de ti...
             </p>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
               {Array.from({ length: 10 }).map((_, i) => (
@@ -103,25 +105,33 @@ export default function Deals() {
         {!loading && category && products.length > 0 && (
           <>
             <p className="text-[13px] text-[var(--text-muted)] mb-5">
-              {products.length} {products.length === 1 ? "producto" : "productos"} de {category} por menos de $100 con envío incluido
+              {products.length} {products.length === 1 ? "producto" : "productos"} de {category} por menos de $100
             </p>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
               {products.map((p, i) => {
-                const params = new URLSearchParams();
-                if (p.rappi_product_id) params.set("r", p.rappi_product_id);
-                if (p.ubereats_product_id) params.set("u", p.ubereats_product_id);
-                const platformColor = PLATFORM_COLOR[p.best_platform] ?? "var(--savings)";
-                const platformLabel = PLATFORM_LABEL[p.best_platform] ?? p.best_platform;
+                const params = new URLSearchParams({
+                  rappi: p.rappi_store_id, ue: p.ubereats_store_id, name: p.restaurant_name,
+                  r: p.rappi_product_id, u: p.ubereats_product_id,
+                });
+                const platform = p.price_platform ?? "rappi";
+                const platformColor = PLATFORM_COLOR[platform];
+                const platformLabel = PLATFORM_LABEL[platform];
+                const off = p.real_price && p.real_price > p.price ? Math.round((1 - p.price / p.real_price) * 100) : 0;
 
                 return (
                   <Link
-                    key={`${p.restaurant_id}-${p.rappi_product_id || p.ubereats_product_id}-${i}`}
-                    href={`/compare/${p.restaurant_id}?${params.toString()}`}
+                    key={`${p.rappi_store_id}-${p.rappi_product_id}-${i}`}
+                    href={`/compare/dinamico?${params.toString()}`}
                     className="block"
                   >
                     <div className="kupi-card h-full bg-[var(--surface)] border border-[var(--border)] rounded-xl overflow-hidden">
                       {/* Imagen */}
-                      <div className="h-24 bg-[var(--bg)] overflow-hidden">
+                      <div className="relative h-24 bg-[var(--bg)] overflow-hidden">
+                        {off > 0 && (
+                          <span className="absolute top-1.5 left-1.5 z-10 text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-[var(--savings)] text-white">
+                            -{off}%
+                          </span>
+                        )}
                         {p.image_url ? (
                           <img
                             src={proxyImage(p.image_url)}
@@ -153,7 +163,8 @@ export default function Deals() {
                             {platformLabel}
                           </span>
                           <span className="text-[13px] font-bold text-[var(--savings)] shrink-0">
-                            ${p.total.toFixed(0)}
+                            ${p.price.toFixed(0)}
+                            {off > 0 && <span className="ml-1 text-[11px] font-medium text-[var(--text-muted)] line-through">${p.real_price!.toFixed(0)}</span>}
                           </span>
                         </div>
                       </div>
@@ -169,7 +180,7 @@ export default function Deals() {
         {!loading && category && products.length === 0 && (
           <div className="py-20 text-center">
             <p className="text-[15px] text-[var(--text-muted)]">
-              No hay productos de <span className="text-[var(--text-primary)] font-medium">{category}</span> por menos de $100 con envío incluido.
+              No hay productos de <span className="text-[var(--text-primary)] font-medium">{category}</span> por menos de $100 cerca de ti.
             </p>
           </div>
         )}

@@ -3,7 +3,8 @@ import { useState, useMemo, useEffect, useRef } from "react";
 import TopNav from "../components/TopNav";
 import CategoryChips from "../components/CategoryChips";
 import RestaurantCard from "../components/RestaurantCard";
-import { fetchStoresStatus, searchRestaurants, fetchPopularRestaurants, proxyImage, SearchResult, PopularRestaurant } from "../lib/api";
+import OfferSections from "../components/OfferSections";
+import { fetchStoresStatus, searchRestaurants, fetchPopularRestaurants, fetchOffers, fetchPlatformsStatus, proxyImage, SearchResult, PopularRestaurant, OfferSection, PlatformsStatus } from "../lib/api";
 import { useLocation } from "../lib/location";
 import { useLang } from "../lib/i18n";
 
@@ -61,10 +62,39 @@ export default function Buscar() {
     lastSearchedRef.current = "";
   }, [locationKey]);
 
+  // Si una app no responde (sesión vencida, caída), avisarlo en vez de mostrar resultados incompletos
+  const [platforms, setPlatforms] = useState<PlatformsStatus | null>(null);
+  useEffect(() => {
+    if (!hasLocation) return;
+    fetchPlatformsStatus().then(setPlatforms);
+  }, [locationKey, searchResults]);
+  const downPlatforms = [platforms?.rappi.ok === false && "Rappi", platforms?.ubereats.ok === false && "Uber Eats"].filter(Boolean);
+
+  // Ofertas de Rappi y Uber Eats en la zona (el backend las guarda 20 min por zona)
+  const [offers, setOffers] = useState<OfferSection[]>([]);
+  const [loadingOffers, setLoadingOffers] = useState(false);
+  useEffect(() => {
+    setOffers([]);
+    if (!hasLocation) return;
+    setLoadingOffers(true);
+    fetchOffers(location.lat, location.lng)
+      .then(setOffers)
+      .catch(() => {})
+      .finally(() => setLoadingOffers(false));
+  }, [locationKey]);
+
+  const filteredOffers = offers.filter((s) =>
+    platformFilter === "all" || platformFilter === s.platform ||
+    (platformFilter === "both" && s.items.some((i) => i.rappi_store_id && i.ubereats_store_id))
+  ).map((s) =>
+    platformFilter === "both" ? { ...s, items: s.items.filter((i) => i.rappi_store_id && i.ubereats_store_id) } : s
+  );
+
   // Load popular restaurants on mount and when location changes
   useEffect(() => {
-    setLoadingPopular(true);
     setPopular([]);
+    if (!hasLocation) { setLoadingPopular(false); return; }
+    setLoadingPopular(true);
     fetchPopularRestaurants(location.lat, location.lng)
       .then(setPopular)
       .catch(() => {})
@@ -94,6 +124,7 @@ export default function Buscar() {
 
     // Skip API call if we already have results for this query (restored from session)
     if (q === lastSearchedRef.current && searchResults.length > 0) return;
+    if (!hasLocation) return;
 
     setSearching(true);
     setSearchResults([]); // Limpiar resultados anteriores inmediatamente
@@ -168,6 +199,13 @@ export default function Buscar() {
             {t.buscar.subtitle}
           </p>
         </div>
+
+        {downPlatforms.length > 0 && (
+          <div className="mb-6 p-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] text-[14px] text-[var(--text-primary)]">
+            <span className="font-semibold">{downPlatforms.join(" y ")} no está respondiendo en este momento.</span>{" "}
+            Mientras se restablece, solo verás resultados de {downPlatforms.length === 2 ? "ninguna app" : (downPlatforms[0] === "Rappi" ? "Uber Eats" : "Rappi")}.
+          </div>
+        )}
 
         {/* Banner: elige tu ubicación */}
         {!hasLocation && (
@@ -276,9 +314,15 @@ export default function Buscar() {
                       {products.length > 0 ? (
                         <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-hide pl-[52px]">
                           {products.slice(0, 6).map((p, j) => {
+                            const off = p.real_price && p.real_price > p.price ? Math.round((1 - p.price / p.real_price) * 100) : 0;
                             const cardInner = (
                               <>
-                                <div className="h-24 bg-[var(--bg)] overflow-hidden">
+                                <div className="relative h-24 bg-[var(--bg)] overflow-hidden">
+                                  {off > 0 && (
+                                    <span className="absolute top-1.5 left-1.5 z-10 text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-[var(--savings)] text-white">
+                                      -{off}%
+                                    </span>
+                                  )}
                                   {p.image_url ? (
                                     <img
                                       src={proxyImage(p.image_url)}
@@ -293,7 +337,12 @@ export default function Buscar() {
                                 </div>
                                 <div className="p-2">
                                   <p className="text-[12px] font-medium text-[var(--text-primary)] leading-tight line-clamp-2 mb-0.5">{p.name}</p>
-                                  <p className="text-[13px] font-bold text-[var(--savings)]">${p.price.toFixed(0)}</p>
+                                  <p className="text-[13px] font-bold text-[var(--savings)]">
+                                    ${p.price.toFixed(0)}
+                                    {off > 0 && (
+                                      <span className="ml-1 text-[11px] font-medium text-[var(--text-muted)] line-through">${p.real_price!.toFixed(0)}</span>
+                                    )}
+                                  </p>
                                 </div>
                               </>
                             );
@@ -340,6 +389,12 @@ export default function Buscar() {
           </>
         ) : (
           <>
+            <OfferSections
+              sections={filteredOffers}
+              loading={loadingOffers}
+              hrefFor={(item) => buildHref({ ...item, restaurant_name: item.store_name })}
+            />
+
             {/* Popular restaurants section */}
             {filteredPopular.length > 0 && (
               <div className="mb-10">

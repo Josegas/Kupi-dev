@@ -21,12 +21,12 @@ Metabuscador de precios de comida a domicilio (Rappi, Uber Eats, DiDi Food) en M
 
 ---
 
-## Estado actual del proyecto (actualizado 7 oct 2026)
+## Estado actual del proyecto (actualizado 10 oct 2026)
 
 ### Lo que ya funciona end-to-end
 
 **Backend (Python + FastAPI):**
-- Conector Rappi completo: menú, cotización individual, carrito multi-producto, búsqueda de restaurantes
+- Conector Rappi completo: menú, cotización individual, carrito multi-producto, búsqueda de restaurantes, ofertas por zona (sesión de invitado + cuenta dedicada solo para checkout)
 - Conector Uber Eats completo: menú (getStoreV1), cotización con desglose real (createDraftOrderV2 → getCheckoutPresentationV1), carrito multi-producto, auto-customización de productos con opciones obligatorias
 - Conector DiDi parcial: scraping web público (solo precios de producto, sin delivery fee ni cuota de servicio)
 - Worker proxy en Cloudflare para Uber Eats (evita bloqueo de IPs de AWS)
@@ -80,9 +80,18 @@ Metabuscador de precios de comida a domicilio (Rappi, Uber Eats, DiDi Food) en M
 2. **Dominio propio** — Namecheap con GitHub Student Pack.
 3. **Experimento de precios dinámicos** — Muestreo intensivo (15-20 productos cada 5 min, 48-72h) para detectar patrones.
 4. **Configurar EventBridge para health check** — Cuando Kupi-dev tenga su propia Lambda, crear regla EventBridge con `{"job": "health_check"}` cada 4-6 horas (solo aplica a la infra de Kupi-dev, no tocar la del hackathon).
+6. **Supabase propio de Kupi-dev** (lo hace el dueño) — Hoy Kupi-dev apunta al Supabase del hackathon en **solo lectura** (`supabase_client.py` bloquea escrituras y storage). Crear un proyecto nuevo gratuito, correr `supabase/schema.sql` y poner sus claves en `.env` y `web/.env.local`. Hasta entonces favoritos, alertas y auto-populate no se guardan en dev.
+7. **Mejor cruce entre apps en ciudades grandes** — En la auditoría por estados (9 oct 2026) CDMX, Guadalajara, Mérida y Zacatecas solo tenían 4-9 restaurantes en ambas apps. Mejora: para los que salen en una sola app, buscarlos por nombre en la otra.
+8. **Re-probar de día Reynosa y Acapulco** — De noche el feed de Rappi dio `NO_RESULTS` (sin tiendas abiertas). Toluca centro no tiene cobertura de Rappi (Metepec sí). Revisar también de día los carruseles de ofertas de Rappi (`TOP_CAROUSEL_PRODUCTS` no aparecen de noche; mientras tanto se usa "Ofertas cerca de ti" sacado de los menús).
+9. **Reintento en Supabase** — Lecturas del catálogo fallan a veces con "Server disconnected"; agregar un reintento.
+10. **`rotate.py --rappi` lee las cookies demasiado pronto** — Si el login termina después del primer token, captura un token de invitado sin refresh token. Esperar a que `rappi.type` sea `1` antes de leer. (Mientras: volver a correrlo.)
+11. **`refresh_coupons` sigue usando Culiacán por defecto** — Debe usar la zona del usuario.
+12. **Despliegue de Kupi-dev** — Recomendado un servidor siempre encendido gratuito en vez de Lambda (cachés en memoria, sesión de invitado de Rappi). Presupuesto $0.
+
+**Auditoría por estados (9 oct 2026):** las 32 entidades respondieron; en 29 se obtuvo cotización exacta en ambas apps, ninguna aproximada. Las 3 restantes: Toluca (sin Rappi), Reynosa y Acapulco (sin tiendas de Rappi abiertas de noche).
 5. **Ofertas del canal de WhatsApp de Rappi** (pendiente desde 6 oct 2026) — El canal "Rappi México" (`https://www.whatsapp.com/channel/0029Vavdy1EBFLga5N5T5d1J`) publica promos de precio por tiempo limitado, no códigos (ej. "Caffenio: Mexicano Caliente — $19" + enlace `rappi.sng.link` que en web solo abre el inicio de Rappi). Las publicaciones no son públicas: requieren entrar a WhatsApp.
    - **Hallazgo (7 oct 2026, promo "Frutos Prohibidos — Chilaquiles medianos a $78", CDMX):** la promo **sí existe en Rappi pero depende de la dirección**. En la app, con dirección registrada en Ámsterdam 244, Hipódromo, CDMX, aparece una sección "Ahorros Exclusivos" con Chilaquiles medianos $77.50 (-40%, antes $129) y Pecado original $122.50 (-30%). Con dirección en Culiacán no aparece.
-   - Sin embargo, el endpoint web que usa Kupi (`store/id` con lat/lng de CDMX) sigue dando $129, `real_price` = `price`, `discounts[]` vacío y sin pasillo "Ahorros Exclusivos" (probado en Frutos Prohibidos - Orizaba, `990008239`). El checkout de Rappi falla con 400 para tiendas de CDMX porque `change-address` no puede mover la dirección de la cuenta.
+   - Sin embargo, el endpoint web que usa Kupi (`store/id` con lat/lng de CDMX) sigue dando $129, `real_price` = `price`, `discounts[]` vacío y sin pasillo "Ahorros Exclusivos" (probado en Frutos Prohibidos - Orizaba, `990008239`). El checkout de Rappi falla con 400 para tiendas de CDMX porque `change-address` no puede mover la dirección de la cuenta (resuelto 8 oct: hay que cambiar la dirección activa de la cuenta, ver hallazgos del 8 oct abajo).
    - **Las promos son solo de la app de Rappi:** se probó Rappi web de escritorio y web móvil (`rappi.com.mx/promociones`, que es a donde manda el enlace) con la dirección de CDMX, y en ninguna aparece la oferta ni "Ahorros Exclusivos".
    - También existe `web.rappi.com.mx/promotions` (sitio nuevo, renderizado en servidor). Su lista sale de `GET web.rappi.com.mx/_server-islands/PromotionsContent` y cada producto trae `pricing.originalPrice`, `currentPrice` y `offerTag`. Pero las 30 "promociones" que mostró en CDMX tenían `originalPrice: null` y `offerTag` vacío: son recomendaciones, no ofertas. Si algún día trae descuentos reales, ahí se verían. La ficha de producto (`_server-islands/RestProductDetailContent`) trae `pricing.price` y `basePrice`.
    - **Siguiente paso recomendado:** capturar el tráfico de la **app** de Rappi con el mismo montaje planeado para DiDi (Honor 20 + scrcpy + mitmproxy + Frida para saltar certificate pinning), para encontrar el endpoint de "Ahorros Exclusivos". Con eso Kupi consultaría promos por zona directo de Rappi (todas, no solo las del canal). Conviene hacerlo junto con el pendiente 1 (DiDi), porque el montaje es el mismo.
@@ -111,6 +120,16 @@ Metabuscador de precios de comida a domicilio (Rappi, Uber Eats, DiDi Food) en M
 
    **Lo único pendiente (requiere una PROMO ACTIVA, de día):** confirmar los campos exactos que marcan un producto rebajado en `rest-store-detail` (Rappi) y en `getStoreV1` (UE), y distinguir descuento-normal de Pro. Las ofertas dependen mucho de la hora (de madrugada casi no hay). Cuando el usuario vea una promo de restaurante activa, probar el endpoint de esa tienda desde el backend y cerrar la lógica de extracción.
 
+   **HALLAZGOS 8 oct 2026 — prueba con promo "Chilaquiles de Potzollcalli a $50" (canal de WhatsApp, CDMX):**
+   - **Las ofertas de Rappi son POR CUENTA, no solo por ubicación.** La cuenta de Kupi (`user_id 2626894528`) ve los Chilaquiles a $95 en las 7 sucursales de CDMX (menú web, `rest-store-detail`, `rest-store-brand-id` y carrito: $95 + $10 envío + $6.90 servicio = $111.90, `discount_total 0`), incluso entrando por el enlace del canal (`ad_source: "Whatsapp"`) y con la dirección de CDMX activa. En otro celular, con su cuenta original, sí sale a $50; con la cuenta de Kupi en ese mismo celular NO sale → no es el APK parcheado, es la cuenta.
+   - **Posible bloqueo antifraude de la cuenta de Kupi (sin confirmar):** el usuario está seguro de que antes sí le salían ofertas (ej. Frutos Prohibidos el 7 oct). Hipótesis: Rappi la sacó de las promos por uso automatizado (muchas peticiones desde backend, barrido de búsquedas en cuadrícula, 2 celulares, APK re-firmado, varios `deviceid`, direcciones en 3 ciudades). No se modificó nada permanente de la cuenta (direcciones intactas, carrito vacío, sin Pro). Siguiente paso: crear una **cuenta nueva** en otro celular (número nuevo, `deviceid` propio en backend, no en el Honor 20) y comparar qué ofertas ve contra una cuenta normal, para separar ofertas generales de las de bienvenida (las de usuario nuevo NO se pueden mostrar como precio para todos).
+   - **Para el módulo de ofertas:** consultar lento (pocas tiendas por zona, intervalos largos, un solo `deviceid` fijo, nunca barridos) para no "quemar" la cuenta.
+   - **Marca de Pro (ignorar):** casi todos los productos traen `pricing.info_bubble.subtitle = "Oferta Exclusiva Pro"` (`icon: "pro"`, `ui_style: "golden"`) con el precio normal: es publicidad de Rappi Pro, no descuento. La sección "Descuentos Exclusivos" (`corridor_id 722354`) en Potzollcalli solo traía combos con esa burbuja, sin rebaja.
+   - **Dónde vendría una rebaja real (deducido, falta confirmarlo con una oferta visible):** `analytics.event_properties` (`OFFER_TYPE`, `OFFER_VALUE`, `OFFER_TAG`, `PRODUCT_VALUE` vs `PRODUCT_VALUE_BRUTO`), `pricing.use_base_price`/`base_price`, y en el carrito `real_price`, `discount_total`, `discount_info`.
+   - **La app usa `POST /api/consumer-ui/v2/context/content/rest-store-brand-id`** para abrir la tienda (body con `brand_id`, sin `store_id`; el servidor elige la sucursal según la dirección), y `rest-product-detail` para la ficha. Headers de la app: `user_id`, `deviceid`, `fp_dp_id`, `advertiser-id`, `appsflyer_id`, `app-version: 90037`.
+   - **Cambiar la dirección activa de la cuenta:** `PUT /api/ms/users-address/address` con body `{"id": <address_id>}` (es `selectActiveLocation` del JS de Rappi web). Con la dirección de CDMX activa, **el checkout de tiendas de CDMX SÍ funciona** (antes fallaba con 400): el servidor cotiza según la dirección activa. Ojo: es estado compartido de la cuenta (afecta cotizaciones de otras ciudades mientras esté cambiada); dejarla en Culiacán (`2182736325`) al terminar.
+   - Potzollcalli: `brand_id 823`; sucursales Cuauhtémoc `1306712011`, Tlatelolco `1306712172`, Echegaray `1923201138`, Miramontes `1306712163`, Universidad `1306712157`, Zaragoza `1930017572`, Las Américas `1923773028`. Producto Chilaquiles `10277717`.
+
    **Diseño del módulo de ofertas (backend, sin celular):** recorrer `rest-store-detail` de los restaurantes de cada zona registrada → detectar productos con descuento (no-Pro) → por cada uno, usar el checkout ya existente para el precio final → guardar en Supabase y mostrar en Kupi como "ofertas". Aplica igual para UE con `getStoreV1`/`promotion`.
    - Si no → script local con Playwright + número dedicado leyendo WhatsApp Web, parseo con reglas (tienda, producto, precio). Riesgo: va contra los términos de WhatsApp (baneo del número) y se rompe con cambios de la página. Extraer con IA tendría costo (choca con presupuesto $0).
 
@@ -119,9 +138,14 @@ Metabuscador de precios de comida a domicilio (Rappi, Uber Eats, DiDi Food) en M
 ## Gestión de cookies/tokens
 
 ### Rappi
-- **Qué se necesita**: Bearer token Fernet (`RAPPI_TOKEN`) + Device ID UUID fijo (`RAPPI_DEVICE_ID`)
-- **Dónde se guarda**: `.env` (local), Parameter Store `/kupi/rappi-token` (Lambda)
-- **Cómo se rota**: `python scripts/rotate-cookies/rotate.py --rappi` (abre Brave con perfil persistente, captura token automáticamente, actualiza .env). Luego `bash scripts/rotate-rappi-token.sh` para subir a Parameter Store.
+- **Dos sesiones (desde 9 oct 2026):**
+  - **Invitado** para menús, ofertas, búsqueda y feed. El conector la obtiene solo (`GET /api/rocket/v2/guest/passport/` → `POST /api/rocket/v2/guest` con `x-guest-api-key`; dura 7 días y se renueva sola). Ve las mismas ofertas generales que cualquier usuario.
+  - **Cuenta dedicada de Kupi-dev** (otro número, login con código de WhatsApp en el perfil de Brave) **solo para el checkout**: el envío necesita una dirección guardada y el invitado no puede crearlas ("Invalid header: AUTH_OWNER"). Se renueva sola con `RAPPI_REFRESH_TOKEN`.
+  - **Nunca** usar la cuenta personal del dueño (Rappi cerró todas sus sesiones el 9 oct, probablemente por uso automatizado) ni la del hackathon (`2626894528`, la usa el desplegado).
+- **Precio de referencia = precio de oferta del menú.** Si el checkout de la cuenta cobra otro precio de producto, se usa el del menú + la cuota de servicio del carrito de invitado; si la cuota es porcentual y no se puede confirmar, no se muestra total (regla de precio exacto). Envío con precio tachado (ej. "envío gratis en tu primera orden", promo de usuario nuevo) → se usa el precio tachado.
+- **Salud:** `/status` devuelve `rappi` (lecturas) y `rappi_checkout` (cuenta). Se marca caída tras 3 respuestas 401/5xx seguidas.
+- **Qué se necesita en `.env`**: `RAPPI_TOKEN`, `RAPPI_DEVICE_ID`, `RAPPI_REFRESH_TOKEN` y `RAPPI_AUTH_USER` de la cuenta dedicada.
+- **Cómo se rota**: `python scripts/rotate-cookies/rotate.py --rappi` (si la sesión del navegador expiró, antes `--setup` e iniciar sesión con la cuenta de Kupi-dev). Consultar con poco volumen para no "quemar" la cuenta.
 
 ### Uber Eats
 - **Qué se necesita**: Cookie string completo (`UBEREATS_COOKIE_STRING`) con `dId`, `jwt-session`, `uev2.id.session_v2`, etc.

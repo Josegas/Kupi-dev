@@ -2,6 +2,7 @@
 import { useState, useEffect } from "react";
 import { Heart } from "lucide-react";
 import { useAuth } from "../lib/auth";
+import { useLocation } from "../lib/location";
 import { useRouter } from "next/navigation";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -28,6 +29,7 @@ export default function FavoriteButton({
   className = "",
 }: Props) {
   const { user, session } = useAuth();
+  const { location } = useLocation();
   const router = useRouter();
   const [isFavorite, setIsFavorite] = useState(false);
   const [favoriteId, setFavoriteId] = useState<number | null>(null);
@@ -87,6 +89,9 @@ export default function FavoriteButton({
             rappi_store_id: rappiStoreId || null,
             ubereats_store_id: ubereatsStoreId || null,
             image_url: imageUrl || "",
+            // El historial de precios se mide donde está el usuario (el envío depende de eso)
+            lat: location.lat,
+            lng: location.lng,
           }),
         });
         if (resp.ok) {

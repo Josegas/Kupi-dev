@@ -13,11 +13,13 @@ Uso:
 Requiere: pip install playwright && playwright install chromium
 """
 import argparse
+import base64
 import json
 import os
 import re
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 try:
@@ -111,19 +113,25 @@ def setup(pw):
 
 
 def capture_rappi(pw) -> bool:
-    """Captura el Bearer token de Rappi interceptando llamadas a la API."""
+    """
+    Captura la sesión web de Rappi: Bearer token, deviceid y refresh token.
+    Con el refresh token el backend renueva la sesión solo (POST /api/rocket/refresh-token),
+    así que esto solo hace falta después de iniciar sesión (--setup).
+    """
     print("\n=== Capturando token de Rappi ===")
 
     browser = _launch_brave(pw)
 
     page = browser.new_page()
     token_found = None
+    device_id = None
 
     def handle_request(request):
-        nonlocal token_found
+        nonlocal token_found, device_id
         auth = request.headers.get("authorization", "")
         if auth.startswith("Bearer ft.") and not token_found:
             token_found = auth.replace("Bearer ", "")
+            device_id = request.headers.get("deviceid")
             print(f"  Token capturado ({len(token_found)} chars)")
 
     page.on("request", handle_request)
@@ -149,15 +157,32 @@ def capture_rappi(pw) -> bool:
                 break
             time.sleep(1)
 
+    # Cookies de sesión: rappi.type "1" = sesión iniciada ("0" = invitado, no puede cotizar);
+    # rappi_refresh_token va en base64 (la web lo "cifra" con btoa)
+    cookies = {}
+    try:
+        cookies = {c["name"]: c["value"] for c in browser.cookies() if "rappi" in c["domain"]}
+    except Exception:
+        pass
     try:
         browser.close()
     except Exception:
         pass  # El usuario ya cerró el navegador
 
+    if token_found and cookies.get("rappi.type") == "0":
+        print("  ERROR: Rappi está en modo invitado (sin sesión). Inicia sesión: python rotate.py --setup")
+        return False
     if token_found:
-        if _update_env("RAPPI_TOKEN", token_found):
-            print(f"  .env actualizado con RAPPI_TOKEN")
-            return True
+        _update_env("RAPPI_TOKEN", token_found)
+        if device_id:
+            _update_env("RAPPI_DEVICE_ID", device_id)
+        refresh = cookies.get("rappi_refresh_token")
+        if refresh:
+            _update_env("RAPPI_REFRESH_TOKEN", base64.b64decode(urllib.parse.unquote(refresh)).decode())
+            print("  .env actualizado con RAPPI_TOKEN, RAPPI_DEVICE_ID y RAPPI_REFRESH_TOKEN")
+        else:
+            print("  .env actualizado con RAPPI_TOKEN (sin refresh token: no se renovará solo)")
+        return True
     else:
         print("  ERROR: No se pudo capturar el token.")
         print("  Verifica que tengas sesión activa: python rotate.py --setup")

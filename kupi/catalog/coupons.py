@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 from kupi.catalog.supabase_client import get_client
 from kupi.connectors.rappi.connector import RappiConnector
-from kupi.connectors.ubereats.connector import _call_ubereats, _build_headers, _BASE_URL
+from kupi.connectors.ubereats.connector import _get_store
 from kupi.core.config import DEFAULT_LAT, DEFAULT_LNG
 
 logger = logging.getLogger(__name__)
@@ -89,14 +89,7 @@ def _extract_rappi_coupons(r: dict, lat: float, lng: float) -> list[dict]:
 
 def _extract_ubereats_coupons(r: dict, lat: float, lng: float) -> list[dict]:
     try:
-        headers = _build_headers(lat, lng)
-        body = {
-            "storeUuid": r["ubereats_store_id"],
-            "diningMode": "DELIVERY",
-            "time": {"asap": True},
-            "cbType": "EATER_ENDORSED",
-        }
-        data = _call_ubereats(f"{_BASE_URL}/getStoreV1?localeCode=mx", headers, body).get("data", {})
+        data = _get_store(r["ubereats_store_id"], lat, lng)
     except Exception as e:
         logger.warning("UberEats %s: %s", r["restaurant_id"], e)
         return []

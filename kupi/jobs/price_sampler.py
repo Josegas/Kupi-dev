@@ -9,33 +9,39 @@ from datetime import datetime, timedelta, timezone
 
 from kupi.connectors.rappi.connector import RappiConnector
 from kupi.connectors.ubereats.connector import UberEatsConnector
-from kupi.core.config import DEFAULT_LAT, DEFAULT_LNG
+
+
+def _zone(coord: float) -> float:
+    """Redondea a 2 decimales (~1 km): zona en la que se cotizan los favoritos."""
+    return round(float(coord), 2)
 
 
 def run() -> dict:
     """Ejecuta el muestreo de precios y la evaluación de alertas."""
-    from supabase import create_client
+    from kupi.catalog.supabase_client import get_client
 
-    url = os.environ.get("SUPABASE_URL", "")
-    key = os.environ.get("SUPABASE_SECRET_KEY", "")
-    if not url or not key:
-        return {"error": "SUPABASE_URL/SECRET_KEY no configurados"}
-
-    sb = create_client(url, key)
+    try:
+        sb = get_client()
+    except RuntimeError as e:
+        return {"error": str(e)}
 
     # 1. Obtener productos únicos que alguien tiene en favoritos
     favs_resp = sb.table("user_favorites").select(
-        "rappi_product_id, ubereats_product_id, product_name, rappi_store_id, ubereats_store_id"
+        "rappi_product_id, ubereats_product_id, product_name, rappi_store_id, ubereats_store_id, lat, lng"
     ).execute()
 
     if not favs_resp.data:
         return {"sampled": 0, "alerts_sent": 0}
 
-    # Deduplicar por par de product IDs
+    # Deduplicar por producto y zona (~1 km): el envío depende de dónde está cada usuario,
+    # así que se cotiza en la zona de quien lo guardó. Sin ubicación no se puede cotizar.
     seen = set()
     unique_products = []
     for f in favs_resp.data:
-        key_tuple = (f.get("rappi_product_id"), f.get("ubereats_product_id"))
+        if f.get("lat") is None or f.get("lng") is None:
+            continue
+        f = {**f, "lat": _zone(f["lat"]), "lng": _zone(f["lng"])}
+        key_tuple = (f.get("rappi_product_id"), f.get("ubereats_product_id"), f["lat"], f["lng"])
         if key_tuple not in seen:
             seen.add(key_tuple)
             unique_products.append(f)
@@ -54,14 +60,15 @@ def run() -> dict:
         rappi_pid = product.get("rappi_product_id")
         ue_pid = product.get("ubereats_product_id")
         name = product.get("product_name", "")
+        lat, lng = product["lat"], product["lng"]
 
         # Rappi
         if rappi_sid and rappi_pid:
             try:
-                menu = rappi.fetch_menu(rappi_sid, DEFAULT_LAT, DEFAULT_LNG)
+                menu = rappi.fetch_menu(rappi_sid, lat, lng)
                 prod = next((p for p in menu if p.product_id == rappi_pid), None)
                 if prod:
-                    quote = rappi.fetch_price(rappi_sid, prod, DEFAULT_LAT, DEFAULT_LNG)
+                    quote = rappi.fetch_price(rappi_sid, prod, lat, lng)
                     results.append({
                         "rappi_product_id": rappi_pid,
                         "ubereats_product_id": ue_pid,
@@ -73,6 +80,8 @@ def run() -> dict:
                         "total": quote.total,
                         "rappi_store_id": rappi_sid,
                         "ubereats_store_id": ue_sid,
+                        "lat": lat,
+                        "lng": lng,
                     })
             except Exception as e:
                 print(f"[price_sampler] Rappi error {rappi_pid}: {e}")
@@ -80,10 +89,10 @@ def run() -> dict:
         # UberEats
         if ue_sid and ue_pid:
             try:
-                menu = ubereats.fetch_menu(ue_sid, DEFAULT_LAT, DEFAULT_LNG)
+                menu = ubereats.fetch_menu(ue_sid, lat, lng)
                 prod = next((p for p in menu if p.product_id == ue_pid), None)
                 if prod:
-                    quote = ubereats.fetch_price(ue_sid, prod, DEFAULT_LAT, DEFAULT_LNG)
+                    quote = ubereats.fetch_price(ue_sid, prod, lat, lng)
                     results.append({
                         "rappi_product_id": rappi_pid,
                         "ubereats_product_id": ue_pid,
@@ -95,6 +104,8 @@ def run() -> dict:
                         "total": quote.total,
                         "rappi_store_id": rappi_sid,
                         "ubereats_store_id": ue_sid,
+                        "lat": lat,
+                        "lng": lng,
                     })
             except Exception as e:
                 print(f"[price_sampler] UberEats error {ue_pid}: {e}")
@@ -128,7 +139,7 @@ def _evaluate_alerts(sb, new_snapshots: list[dict]) -> int:
     """
     # Obtener alertas activas con info del favorito
     alerts_resp = sb.table("price_alerts").select(
-        "*, user_favorites(rappi_product_id, ubereats_product_id, product_name, restaurant_name)"
+        "*, user_favorites(rappi_product_id, ubereats_product_id, product_name, restaurant_name, lat, lng)"
     ).eq("is_active", True).execute()
 
     if not alerts_resp.data:
@@ -145,10 +156,15 @@ def _evaluate_alerts(sb, new_snapshots: list[dict]) -> int:
 
         rappi_pid = fav.get("rappi_product_id")
         ue_pid = fav.get("ubereats_product_id")
+        if fav.get("lat") is None or fav.get("lng") is None:
+            continue
+        zlat, zlng = _zone(fav["lat"]), _zone(fav["lng"])
 
-        # Buscar el snapshot nuevo para este producto
+        # Buscar el snapshot nuevo para este producto en la zona del usuario
         new = None
         for s in new_snapshots:
+            if s.get("lat") != zlat or s.get("lng") != zlng:
+                continue
             if (rappi_pid and s.get("rappi_product_id") == rappi_pid) or \
                (ue_pid and s.get("ubereats_product_id") == ue_pid):
                 if new is None or s["total"] < new["total"]:
@@ -159,7 +175,10 @@ def _evaluate_alerts(sb, new_snapshots: list[dict]) -> int:
 
         # Buscar el snapshot anterior (el más reciente antes de este batch)
         since = (now - timedelta(days=7)).isoformat()
-        prev_query = sb.table("price_snapshots").select("total, platform").eq("platform", new["platform"])
+        prev_query = (
+            sb.table("price_snapshots").select("total, platform")
+            .eq("platform", new["platform"]).eq("lat", zlat).eq("lng", zlng)
+        )
 
         if rappi_pid:
             prev_query = prev_query.eq("rappi_product_id", rappi_pid)

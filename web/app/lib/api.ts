@@ -45,6 +45,8 @@ export interface CombinedProduct {
   name: string;
   description: string;
   price: number;
+  real_price?: number;
+  price_platform?: "rappi" | "ubereats";  // app con el precio más bajo (price)
   image_url: string;
   rappi_product_id: string;
   ubereats_product_id: string;
@@ -55,6 +57,7 @@ export interface ExclusiveProduct {
   name: string;
   description: string;
   price: number;
+  real_price?: number;
   image_url: string;
   platform: "rappi" | "ubereats";
   rappi_product_id?: string;
@@ -83,42 +86,23 @@ function parseDetail(detail: unknown, status: number): string {
   return `Error ${status}`;
 }
 
-export interface FeaturedProduct {
-  name: string;
-  price: number;
-  image_url: string;
-  restaurant_id: string;
-  restaurant_name: string;
-  category: string;
-  rappi_product_id: string;
-  ubereats_product_id: string;
-  rappi_store_id: string;
-  ubereats_store_id: string;
-}
-
 export interface DealProduct {
   name: string;
-  price: number;          // precio del producto (catálogo)
-  total: number;          // total real verificado (producto + envío + cuota)
-  best_platform: string;  // plataforma más barata
+  price: number;          // precio de menú más bajo entre las dos apps (con oferta, si hay)
+  real_price?: number;    // precio sin oferta
+  price_platform?: "rappi" | "ubereats";
   image_url: string;
-  restaurant_id: string;
   restaurant_name: string;
   category: string;
+  rappi_store_id: string;
+  ubereats_store_id: string;
   rappi_product_id: string;
   ubereats_product_id: string;
-  quotes: Array<{ platform: string; total: number; delivery_fee: number | null }>;
 }
 
-export async function fetchFeaturedProducts(lat: number, lng: number, maxPrice = 200): Promise<FeaturedProduct[]> {
-  const params = new URLSearchParams({ max_price: String(maxPrice), lat: String(lat), lng: String(lng) });
-  const res = await fetch(`${API_URL}/products/featured?${params}`);
-  if (!res.ok) return [];
-  return res.json();
-}
-
-export async function fetchDeals(category: string, maxPrice = 100): Promise<DealProduct[]> {
-  const res = await fetch(`${API_URL}/products/deals?category=${encodeURIComponent(category)}&max_price=${maxPrice}`);
+export async function fetchDeals(category: string, lat: number, lng: number, maxPrice = 100): Promise<DealProduct[]> {
+  const params = new URLSearchParams({ category, lat: String(lat), lng: String(lng), max_price: String(maxPrice) });
+  const res = await fetch(`${API_URL}/products/deals?${params}`);
   if (!res.ok) return [];
   return res.json();
 }
@@ -162,6 +146,7 @@ export async function fetchCombinedMenu(
 export interface MatchingProduct {
   name: string;
   price: number;
+  real_price?: number;  // precio sin oferta; si es mayor que price, hay oferta
   image_url: string;
   product_id: string;
 }
@@ -192,6 +177,45 @@ export interface PopularRestaurant {
   image_url: string;
   cuisine: string;
   is_open: boolean;
+}
+
+export interface OfferItem {
+  rappi_store_id: string | null;
+  ubereats_store_id: string | null;
+  store_name: string;
+  image_url: string;
+  // Productos (Rappi)
+  name?: string;
+  price?: number;
+  real_price?: number;
+  eta?: string;
+  // Tiendas (Uber Eats)
+  offer?: string;
+  rating?: string;
+}
+
+export interface OfferSection {
+  title: string;
+  platform: "rappi" | "ubereats";
+  kind: "products" | "stores";
+  items: OfferItem[];
+}
+
+export async function fetchOffers(lat: number, lng: number): Promise<OfferSection[]> {
+  const params = new URLSearchParams({ lat: String(lat), lng: String(lng) });
+  const res = await fetch(`${API_URL}/offers?${params}`);
+  if (!res.ok) return [];
+  return (await res.json()).sections ?? [];
+}
+
+export interface PlatformsStatus {
+  rappi: { ok: boolean; since: number };
+  ubereats: { ok: boolean; since: number };
+}
+
+export async function fetchPlatformsStatus(): Promise<PlatformsStatus | null> {
+  const res = await fetch(`${API_URL}/status`).catch(() => null);
+  return res?.ok ? res.json() : null;
 }
 
 export async function fetchPopularRestaurants(lat: number, lng: number): Promise<PopularRestaurant[]> {

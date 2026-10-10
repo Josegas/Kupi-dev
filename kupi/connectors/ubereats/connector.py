@@ -1,15 +1,22 @@
 import json
 import logging
 import os
+import re
 import urllib.parse
 import uuid as uuid_lib
 import requests as _requests
 from curl_cffi import requests
 from kupi.connectors.base import BaseConnector
+from kupi.core.cache import PlatformHealth, Throttle, TTLStore, loc_key, zone_center
 from kupi.core.config import UBEREATS_COOKIE_STRING
 from kupi.core.models import Product, PriceQuote, CartItemDetail
 
 logger = logging.getLogger(__name__)
+
+_throttle = Throttle(0.35)                      # espacio mínimo entre peticiones a Uber Eats
+health = PlatformHealth("Uber Eats")
+_store_cache = TTLStore(maxsize=512, ttl=300)   # getStoreV1, 5 min
+_quote_cache = TTLStore(maxsize=1024, ttl=300)  # cotizaciones (draft + checkout), 5 min
 
 _BASE_URL = "https://www.ubereats.com/_p/api"
 _WORKER_URL = os.getenv("UBEREATS_WORKER_URL", "")
@@ -44,17 +51,73 @@ def _parse_cookies(cookie_string: str) -> dict[str, str]:
     return cookies
 
 
-def _build_headers(lat: float, lng: float, referer: str = "https://www.ubereats.com/") -> dict:
-    """Construye el dict de headers con cookies y ubicación listos."""
+_LOC_COOKIE = re.compile(r"(^|;\s*)uev2\.loc=[^;]*")
+_place_cache = TTLStore(maxsize=2048, ttl=86400)  # lugar de Uber Eats por zona de ~110 m, 24 h
+
+
+def _cookie_for(lat: float, lng: float, place: dict | None = None) -> str:
+    """
+    Cookies de la sesión con la ubicación del usuario. Uber Eats toma la ubicación del feed,
+    la búsqueda y la dirección de entrega de los borradores de la cookie uev2.loc (ignora los
+    headers x-uber-*-location), así que se reescribe con las coordenadas de cada petición.
+    Los borradores además exigen la referencia de un lugar (si no, 401): ver _place_at.
+    """
+    place = place or {}
+    line1, line2 = place.get("addressLine1", ""), place.get("addressLine2", "")
+    loc = {
+        "address": {"address1": line1, "address2": line2, "aptOrSuite": "",
+                    "eaterFormattedAddress": ", ".join(x for x in (line1, line2) if x),
+                    "subtitle": line2, "title": line1, "uuid": ""},
+        "latitude": lat, "longitude": lng,
+        "reference": place.get("id", ""), "referenceType": place.get("provider", ""), "type": place.get("provider", ""),
+        "addressComponents": {}, "categories": place.get("categories", []),
+        "originType": "user_autocomplete" if place else "",
+    }
+    value = urllib.parse.quote(json.dumps(loc, separators=(",", ":")))
+    cookie, n = _LOC_COOKIE.subn(lambda m: f"{m.group(1)}uev2.loc={value}", UBEREATS_COOKIE_STRING)
+    return cookie if n else f"{UBEREATS_COOKIE_STRING}; uev2.loc={value}"
+
+
+def _headers(lat: float, lng: float, cookie: str, referer: str) -> dict:
     return {
         **_HEADERS_BASE,
-        "cookie": UBEREATS_COOKIE_STRING,
+        "cookie": cookie,
         "referer": referer,
         "x-uber-device-location-latitude": str(lat),
         "x-uber-device-location-longitude": str(lng),
         "x-uber-target-location-latitude": str(lat),
         "x-uber-target-location-longitude": str(lng),
     }
+
+
+def _place_at(lat: float, lng: float) -> dict:
+    """
+    Lugar de Uber Eats en las coordenadas (mapsSearchV1 con "lat,lng" devuelve el lugar que
+    está en ese punto). Es la referencia que exigen los borradores para cotizar la entrega.
+    """
+    def fetch() -> dict:
+        data = _call_ubereats(
+            f"{_BASE_URL}/mapsSearchV1?localeCode=mx",
+            _headers(lat, lng, _cookie_for(lat, lng), "https://www.ubereats.com/"),
+            {"query": f"{lat},{lng}"},
+        )
+        places = data.get("data") or []
+        return places[0] if places else {}
+    return _place_cache.get_or_fetch(loc_key(lat, lng), fetch)
+
+
+def _build_headers(lat: float, lng: float, referer: str = "https://www.ubereats.com/", with_place: bool = False) -> dict:
+    """
+    Headers con cookies y ubicación. Solo los borradores (cotizar) necesitan la referencia del
+    lugar: menús, feed y búsqueda funcionan sin ella y así no cuestan una consulta extra.
+    """
+    place = None
+    if with_place:
+        try:
+            place = _place_at(lat, lng)
+        except Exception as e:
+            logger.warning("Uber Eats: no se pudo obtener el lugar en (%.4f, %.4f): %s", lat, lng, e)
+    return _headers(lat, lng, _cookie_for(lat, lng, place), referer)
 
 
 def _build_session(lat: float, lng: float) -> requests.Session:
@@ -118,6 +181,9 @@ def _call_ubereats(url: str, headers: dict, body: dict) -> dict:
     Llama a UberEats. Si hay un Worker configurado, lo usa como proxy
     (evita el bloqueo de IPs de AWS). Si no, llama directo con curl_cffi.
     """
+    if not health.allow():
+        raise RuntimeError("Uber Eats no está respondiendo por ahora")
+    _throttle.wait()
     if _WORKER_URL and _WORKER_SECRET:
         resp = _requests.post(
             _WORKER_URL,
@@ -125,13 +191,23 @@ def _call_ubereats(url: str, headers: dict, body: dict) -> dict:
             headers={"x-kupi-secret": _WORKER_SECRET},
             timeout=20,
         )
-        resp.raise_for_status()
-        return resp.json()
     else:
         # Desarrollo local: llamada directa con curl_cffi
         resp = requests.post(url, json=body, headers=headers, impersonate="chrome120", timeout=20)
-        resp.raise_for_status()
-        return resp.json()
+    health.record(resp.status_code)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _get_store(store_id: str, lat: float, lng: float) -> dict:
+    """getStoreV1 (catálogo, nombre, dirección y horario de la tienda), en caché 5 min."""
+    def fetch() -> dict:
+        body = {"storeUuid": store_id, "diningMode": "DELIVERY", "time": {"asap": True}, "cbType": "EATER_ENDORSED"}
+        data = _call_ubereats(f"{_BASE_URL}/getStoreV1?localeCode=mx", _build_headers(lat, lng), body)
+        if data.get("status") != "success":
+            raise RuntimeError(f"getStoreV1 falló: {data.get('data', {}).get('errorMessage', 'unknown')}")
+        return data["data"]
+    return _store_cache.get_or_fetch((store_id, loc_key(lat, lng, 2)), fetch)
 
 
 def _discard_draft(draft_order_uuid: str, store_id: str, lat: float, lng: float) -> None:
@@ -153,21 +229,13 @@ class UberEatsConnector(BaseConnector):
         Llama a getStoreV1 y parsea el catálogo completo.
         Guarda section_uuid y subsection_uuid por producto (necesarios para cotizar).
         """
-        headers = _build_headers(lat, lng)
-        body = {
-            "storeUuid": store_id,
-            "diningMode": "DELIVERY",
-            "time": {"asap": True},
-            "cbType": "EATER_ENDORSED",
-        }
-        data = _call_ubereats(f"{_BASE_URL}/getStoreV1?localeCode=mx", headers, body)
-        if data.get("status") != "success":
-            raise RuntimeError(f"getStoreV1 falló: {data.get('data', {}).get('errorMessage', 'unknown')}")
-
-        store_data = data["data"]
-        return _parse_menu(store_data)
+        return _parse_menu(_get_store(store_id, lat, lng))
 
     def fetch_price(self, store_id: str, product: Product, lat: float, lng: float) -> PriceQuote:
+        key = ("price", store_id, product.product_id, loc_key(lat, lng))
+        return _quote_cache.get_or_fetch(key, lambda: self._fetch_price(store_id, product, lat, lng))
+
+    def _fetch_price(self, store_id: str, product: Product, lat: float, lng: float) -> PriceQuote:
         """
         Cotiza el precio real en 2 pasos:
           1. createDraftOrderV2  → obtiene draftOrderUUID
@@ -175,8 +243,10 @@ class UberEatsConnector(BaseConnector):
         Reutiliza el getStoreV1 (ya llamado en fetch_menu) para obtener nombre y dirección.
         """
         # Obtener nombre y dirección de la tienda
-        store_body = {"storeUuid": store_id, "diningMode": "DELIVERY", "time": {"asap": True}, "cbType": "EATER_ENDORSED"}
-        store_data = _call_ubereats(f"{_BASE_URL}/getStoreV1?localeCode=mx", _build_headers(lat, lng), store_body).get("data", {})
+        try:
+            store_data = _get_store(store_id, lat, lng)
+        except RuntimeError:
+            store_data = {}
         store_name = store_data.get("title", "")
         store_address = store_data.get("location", {}).get("address", "")
         is_open = store_data.get("isOpen", True) and store_data.get("isOrderable", True)
@@ -233,14 +303,14 @@ class UberEatsConnector(BaseConnector):
             "businessDetails": {},
         }
         variant_label = ""
-        data1 = _call_ubereats(f"{_BASE_URL}/createDraftOrderV2?localeCode=mx", _build_headers(lat, lng, referer), create_body)
+        data1 = _call_ubereats(f"{_BASE_URL}/createDraftOrderV2?localeCode=mx", _build_headers(lat, lng, referer, with_place=True), create_body)
         if data1.get("status") != "success":
             # Puede fallar por customizaciones obligatorias vacías — obtenerlas y reintentar
             auto_custom, variant_label = _auto_customizations(store_id, product, lat, lng)
             if auto_custom:
                 create_body["shoppingCartItems"][0]["customizations"] = auto_custom
                 create_body["shoppingCartItems"][0]["shoppingCartItemUuid"] = str(uuid_lib.uuid4())
-                data1 = _call_ubereats(f"{_BASE_URL}/createDraftOrderV2?localeCode=mx", _build_headers(lat, lng, referer), create_body)
+                data1 = _call_ubereats(f"{_BASE_URL}/createDraftOrderV2?localeCode=mx", _build_headers(lat, lng, referer, with_place=True), create_body)
             if data1.get("status") != "success":
                 raise RuntimeError(f"createDraftOrderV2 falló: {data1}")
 
@@ -268,7 +338,7 @@ class UberEatsConnector(BaseConnector):
             ],
         }
         try:
-            data2 = _call_ubereats(f"{_BASE_URL}/getCheckoutPresentationV1?localeCode=mx", _build_headers(lat, lng, referer), checkout_body)
+            data2 = _call_ubereats(f"{_BASE_URL}/getCheckoutPresentationV1?localeCode=mx", _build_headers(lat, lng, referer, with_place=True), checkout_body)
         finally:
             _discard_draft(draft_order_uuid, store_id, lat, lng)
         if data2.get("status") != "success":
@@ -285,12 +355,24 @@ class UberEatsConnector(BaseConnector):
         lat: float,
         lng: float,
     ) -> PriceQuote:
+        key = ("cart", store_id, tuple(p.product_id for p in products), loc_key(lat, lng))
+        return _quote_cache.get_or_fetch(key, lambda: self._fetch_cart_price(store_id, products, lat, lng))
+
+    def _fetch_cart_price(
+        self,
+        store_id: str,
+        products: list[Product],
+        lat: float,
+        lng: float,
+    ) -> PriceQuote:
         """
         Cotiza múltiples productos en un solo draft order de Uber Eats.
         Mismos 2 pasos que fetch_price pero con N items en shoppingCartItems.
         """
-        store_body = {"storeUuid": store_id, "diningMode": "DELIVERY", "time": {"asap": True}, "cbType": "EATER_ENDORSED"}
-        store_data = _call_ubereats(f"{_BASE_URL}/getStoreV1?localeCode=mx", _build_headers(lat, lng), store_body).get("data", {})
+        try:
+            store_data = _get_store(store_id, lat, lng)
+        except RuntimeError:
+            store_data = {}
         store_name = store_data.get("title", "")
         store_address = store_data.get("location", {}).get("address", "")
         is_open = store_data.get("isOpen", True) and store_data.get("isOrderable", True)
@@ -336,7 +418,7 @@ class UberEatsConnector(BaseConnector):
             "businessDetails": {},
         }
 
-        data1 = _call_ubereats(f"{_BASE_URL}/createDraftOrderV2?localeCode=mx", _build_headers(lat, lng, referer), create_body)
+        data1 = _call_ubereats(f"{_BASE_URL}/createDraftOrderV2?localeCode=mx", _build_headers(lat, lng, referer, with_place=True), create_body)
         if data1.get("status") != "success":
             # Reintentar con auto-customizaciones por cada producto que lo necesite
             for i, p in enumerate(products):
@@ -344,7 +426,7 @@ class UberEatsConnector(BaseConnector):
                 if auto_custom:
                     create_body["shoppingCartItems"][i]["customizations"] = auto_custom
                     create_body["shoppingCartItems"][i]["shoppingCartItemUuid"] = str(uuid_lib.uuid4())
-            data1 = _call_ubereats(f"{_BASE_URL}/createDraftOrderV2?localeCode=mx", _build_headers(lat, lng, referer), create_body)
+            data1 = _call_ubereats(f"{_BASE_URL}/createDraftOrderV2?localeCode=mx", _build_headers(lat, lng, referer, with_place=True), create_body)
             if data1.get("status") != "success":
                 raise RuntimeError(f"createDraftOrderV2 cart falló: {data1}")
 
@@ -372,7 +454,7 @@ class UberEatsConnector(BaseConnector):
             ],
         }
         try:
-            data2 = _call_ubereats(f"{_BASE_URL}/getCheckoutPresentationV1?localeCode=mx", _build_headers(lat, lng, referer), checkout_body)
+            data2 = _call_ubereats(f"{_BASE_URL}/getCheckoutPresentationV1?localeCode=mx", _build_headers(lat, lng, referer, with_place=True), checkout_body)
         finally:
             _discard_draft(draft_order_uuid, store_id, lat, lng)
         if data2.get("status") != "success":
@@ -444,17 +526,31 @@ def _parse_menu(store_data: dict) -> list[Product]:
                 .get("catalogItems", [])
             )
             for item in items:
+                price = item.get("price", 0) / 100
                 products.append(Product(
                     product_id=item.get("uuid", ""),
                     name=item.get("title", ""),
-                    price=item.get("price", 0) / 100,
-                    real_price=item.get("price", 0) / 100,  # UberEats no distingue real_price en este endpoint
+                    price=price,
+                    real_price=max(price, _original_price(item)),
                     description=item.get("itemDescription", ""),
                     image_url=item.get("imageUrl") or "",
                     section_uuid=section_uuid,
                     subsection_uuid=subsection_uuid,
                 ))
     return products
+
+
+_STRIKETHROUGH_PRICE = re.compile(r"line-through[^>]*>\s*\$([\d,]+(?:\.\d+)?)")
+
+
+def _original_price(item: dict) -> float:
+    """
+    Precio sin oferta de un producto del menú. `price` ya trae la rebaja aplicada; el precio
+    original solo viene tachado en el HTML de priceTagline.textFormat. 0 si no hay oferta.
+    """
+    fmt = (item.get("priceTagline") or {}).get("textFormat") or ""
+    m = _STRIKETHROUGH_PRICE.search(fmt)
+    return _parse_money_text(m.group(1)) if m else 0.0
 
 
 def _parse_money_text(text: str) -> float:
@@ -503,3 +599,70 @@ def _parse_checkout(checkout_data: dict, product: Product, store_id: str, store_
         is_open=is_open,
         opens_at=opens_at,
     )
+
+
+_feed_cache = TTLStore(maxsize=4096, ttl=1200, stale_ttl=3600)  # feed por zona de ~2 km, 20 min
+
+
+def _get_feed(lat: float, lng: float) -> list[dict]:
+    """feedItems del inicio de Uber Eats en la zona. Una sola petición por zona cada 20 min."""
+    lat, lng = zone_center(lat, lng)
+
+    def fetch() -> list[dict]:
+        body = {
+            "cacheKey": "", "feedSessionCount": {"announcementCount": 0, "announcementLabel": ""},
+            "userQuery": "", "date": "", "startTime": 0, "endTime": 0, "carouselId": "", "sortAndFilters": [],
+            "billboardUuid": "", "feedProvider": "", "promotionUuid": "", "targetingStoreTag": "",
+            "venueUUID": "", "selectedSectionUUID": "", "favorites": "", "vertical": "", "searchSource": "",
+            "searchType": "", "keyName": "", "serializedRequestContext": "", "isUserInitiatedRefresh": False,
+        }
+        data = _call_ubereats(f"{_BASE_URL}/getFeedV1?localeCode=mx", _build_headers(lat, lng), body)
+        if data.get("status") != "success":
+            raise RuntimeError("getFeedV1 falló")
+        return (data.get("data") or {}).get("feedItems") or []
+    return _feed_cache.get_or_fetch((lat, lng), fetch)
+
+
+def _feed_store_card(s: dict) -> dict:
+    # La imagen más chica que siga viéndose bien en una tarjeta
+    images = sorted((s.get("image") or {}).get("items") or [], key=lambda i: i.get("width") or 0)
+    image = next((i for i in images if (i.get("width") or 0) >= 500), images[-1] if images else {})
+    return {
+        "store_id": s.get("storeUuid", ""),
+        "store_name": ((s.get("title") or {}).get("text") or "").strip(),
+        "image_url": image.get("url", ""),
+        "offer": " · ".join(sp.get("text", "").strip() for sp in s.get("signposts") or [] if sp.get("text")),
+        "rating": (s.get("rating") or {}).get("text", ""),
+    }
+
+
+def fetch_offer_sections(lat: float, lng: float) -> list[dict]:
+    """
+    Carruseles de tiendas en oferta del inicio de Uber Eats ("Ofertas de hoy", "Ahorra en
+    favoritos nacionales", ...) para la zona.
+    Solo se toman los carruseles en los que todas las tiendas traen etiqueta de oferta
+    (signpost); el resto son recomendaciones ("Popular en tu área", "Vistos recientemente").
+    Se excluyen los de Uber One ("Desbloquea con Uber One"): requieren suscripción.
+    """
+    sections = []
+    for feed_item in _get_feed(lat, lng):
+        if feed_item.get("type") != "REGULAR_CAROUSEL":
+            continue
+        carousel = feed_item.get("carousel") or {}
+        stores = carousel.get("stores") or []
+        if not stores or not all(s.get("signposts") for s in stores):
+            continue
+        title = ((carousel.get("header") or {}).get("title") or {}).get("text", "").replace("\xa0", " ")
+        if title and "Uber One" not in title:
+            sections.append({"title": title, "platform": "ubereats", "kind": "stores",
+                             "items": [_feed_store_card(s) for s in stores]})
+    return sections
+
+
+def fetch_nearby_stores(lat: float, lng: float) -> list[dict]:
+    """Tiendas que entregan en la zona, en el orden del inicio de Uber Eats (mismo feed en caché)."""
+    return [
+        _feed_store_card(item["store"])
+        for item in _get_feed(lat, lng)
+        if item.get("type") == "REGULAR_STORE" and item.get("store")
+    ]

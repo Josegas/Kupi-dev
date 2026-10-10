@@ -70,6 +70,8 @@ interface ListProduct {
   name: string;
   description?: string;
   price: number;
+  real_price?: number;  // precio sin oferta; si es mayor que price, hay oferta
+  price_platform?: "rappi" | "ubereats";  // app con el precio más bajo, en productos de ambas apps
   image_url: string;
   rappi_product_id?: string;
   ubereats_product_id?: string;
@@ -77,8 +79,13 @@ interface ListProduct {
   exclusivePlatform?: "rappi" | "ubereats";
 }
 
+/** Descuento en % (0 si no hay oferta). */
+function discountPct(p: { price: number; real_price?: number }): number {
+  return p.real_price && p.real_price > p.price ? Math.round((1 - p.price / p.real_price) * 100) : 0;
+}
+
 export default function CompareClient({ restaurant }: Props) {
-  const { location } = useLocation();
+  const { location, hasLocation } = useLocation();
   const { t } = useLang();
   const { user, session, signOut } = useAuth();
   const { items: cartItems, addItem: addToCart, clearCart, canAdd, itemCount: cartCount } = useCart();
@@ -165,15 +172,19 @@ export default function CompareClient({ restaurant }: Props) {
           const aFav = isFavorite(a) ? 0 : 1;
           const bFav = isFavorite(b) ? 0 : 1;
           if (aFav !== bFav) return aFav - bFav;
-          // 1. Productos con imagen primero
+          // 1. Ofertas primero, de mayor a menor descuento
+          const aOff = discountPct(a);
+          const bOff = discountPct(b);
+          if (aOff !== bOff) return bOff - aOff;
+          // 2. Productos con imagen primero
           const aImg = a.image_url ? 0 : 1;
           const bImg = b.image_url ? 0 : 1;
           if (aImg !== bImg) return aImg - bImg;
-          // 2. Complementos al final
+          // 3. Complementos al final
           const aComp = isComplement(a.name);
           const bComp = isComplement(b.name);
           if (aComp !== bComp) return aComp ? 1 : -1;
-          // 3. Por precio
+          // 4. Por precio
           return a.price - b.price;
         });
         setAllProducts(merged);
@@ -183,9 +194,10 @@ export default function CompareClient({ restaurant }: Props) {
   };
 
   useEffect(() => {
+    if (!hasLocation) return;
     loadMenu();
     autoSelectedRef.current = false;
-  }, [restaurant, location]);
+  }, [restaurant, location, hasLocation]);
 
   // Cerrar menú de usuario al hacer click fuera
   useEffect(() => {
@@ -556,8 +568,19 @@ export default function CompareClient({ restaurant }: Props) {
                             Solo {PLATFORM_LABELS[p.exclusivePlatform]}
                           </span>
                         )}
+                        {discountPct(p) > 0 && (
+                          <span className="inline-block text-[10px] font-bold px-1.5 py-0.5 rounded-full mb-1 bg-[var(--savings-tint)] text-[var(--savings)]">
+                            -{discountPct(p)}%
+                            {(p.price_platform ?? p.exclusivePlatform) && ` en ${PLATFORM_LABELS[(p.price_platform ?? p.exclusivePlatform)!]}`}
+                          </span>
+                        )}
                         <div className="flex items-center justify-between">
-                          <p className="text-[14px] font-bold text-[var(--savings)]">${p.price.toFixed(0)}</p>
+                          <p className="text-[14px] font-bold text-[var(--savings)]">
+                            ${p.price.toFixed(0)}
+                            {discountPct(p) > 0 && (
+                              <span className="ml-1.5 text-[12px] font-medium text-[var(--text-muted)] line-through">${p.real_price!.toFixed(0)}</span>
+                            )}
+                          </p>
                           <div className="flex items-center gap-1">
                             {/* Botón agregar al carrito */}
                             {(() => {

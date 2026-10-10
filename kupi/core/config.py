@@ -20,6 +20,29 @@ def _load_rappi_token() -> str:
     return ssm.get_parameter(Name="/kupi/rappi-token")["Parameter"]["Value"]
 
 RAPPI_TOKEN: str = _load_rappi_token()
+# Refresh token de la sesión web de Rappi: con él el conector renueva RAPPI_TOKEN solo
+RAPPI_REFRESH_TOKEN: str = os.getenv("RAPPI_REFRESH_TOKEN", "")
+
+_ENV_FILE = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
+
+
+def persist_env(values: dict[str, str]) -> bool:
+    """
+    Guarda valores renovados (ej. tokens) en el .env local para que sobrevivan a un reinicio.
+    En producción no hay .env: ahí hay que guardarlos en el almacén de secretos.
+    """
+    import re
+    if not os.path.isfile(_ENV_FILE):
+        return False
+    with open(_ENV_FILE) as f:
+        content = f.read()
+    for key, value in values.items():
+        line = f"{key}={value}"
+        pattern = re.compile(rf"^{re.escape(key)}=.*$", re.MULTILINE)
+        content = pattern.sub(lambda _: line, content) if pattern.search(content) else content.rstrip("\n") + f"\n{line}\n"
+    with open(_ENV_FILE, "w") as f:
+        f.write(content)
+    return True
 
 def _load_cookie_string() -> str:
     # En desarrollo: leer directo del .env

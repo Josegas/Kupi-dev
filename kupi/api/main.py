@@ -1,4 +1,6 @@
 import difflib
+import html as _html
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re as _re
 import threading
@@ -13,10 +15,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from kupi.core.config import DEFAULT_LAT, DEFAULT_LNG
+from kupi.core.cache import TTLStore, loc_key, zone_center
 from kupi.core.models import PriceQuote
 from kupi.connectors.rappi.connector import RappiConnector, search_stores as rappi_search
+from kupi.connectors.rappi.connector import fetch_offer_sections as rappi_offer_sections
+from kupi.connectors.rappi.connector import fetch_nearby_stores as rappi_nearby_stores
+from kupi.connectors.ubereats.connector import _get_store as _ue_get_store
 from kupi.connectors.ubereats.connector import UberEatsConnector
+from kupi.connectors.ubereats.connector import fetch_offer_sections as ue_offer_sections
+from kupi.connectors.ubereats.connector import fetch_nearby_stores as ue_nearby_stores
 from kupi.connectors.didi.connector import DidiConnector
 
 from kupi.api.favorites import router as favorites_router
@@ -89,6 +96,7 @@ _RESTAURANT_NAME_FIX = {
 
 def _fix_restaurant_name(name: str) -> str:
     """Corrige nombres de sucursal a nombre real del restaurante."""
+    name = _html.unescape(name)  # Uber Eats a veces manda "Pizza&amp;Love"
     key = name.strip().lower()
     for pattern, fixed in _RESTAURANT_NAME_FIX.items():
         if pattern in key:
@@ -109,19 +117,6 @@ _ADDRESS_PATTERN = _re.compile(
     r'^(Avenida|Av\.?|Boulevard|Blvd\.?|Calle|Carretera|Carr\.?|Calz\.?|Calzada|Plaza)\s+',
     _re.IGNORECASE,
 )
-# Nombres que son solo una zona/colonia de Culiacán (Rappi los usa como nombre de sucursal)
-_ZONE_NAMES = {
-    "humaya", "quintas", "las quintas", "montebello", "tres rios", "tres ríos",
-    "culiacan", "culiacán", "nuevo culiacán", "nuevo culiacan",
-    "universitarios", "chapultepec", "guadalupe", "la primavera",
-    "el barrio", "centro", "isla musala", "stanza", "country",
-    "las palmas", "san cristobal", "san cristóbal", "perisur",
-    "fracc portalegre", "portalegre", "la campiña", "la conquista",
-    "lomas del boulevard", "infonavit barrancos", "barrancos",
-    "col libertad", "libertad", "sanalona", "alturas del sur",
-}
-
-
 def _is_address_name(name: str) -> bool:
     """Detecta si un nombre de restaurante es en realidad una dirección o zona."""
     s = name.strip()
@@ -129,9 +124,6 @@ def _is_address_name(name: str) -> bool:
         return True
     # Tiene número de calle (4+ dígitos)
     if _re.search(r'\b\d{4,}\b', s):
-        return True
-    # Es una zona conocida
-    if s.lower().strip() in _ZONE_NAMES:
         return True
     return False
 
@@ -173,11 +165,8 @@ def test_email(to: str = Query(..., description="Email destino")):
 # ══════════════════════════════════════════════════════════════════════
 _search_cache = TTLCache(maxsize=2048, ttl=180)      # búsquedas, 3 min
 _status_cache = TTLCache(maxsize=4096, ttl=600)       # status abierto/cerrado, 10 min
-_popular_cache_store = TTLCache(maxsize=1, ttl=300)   # populares, 5 min
-_featured_cache_store = TTLCache(maxsize=4, ttl=300)  # featured/deals, 5 min
 _image_cache = TTLCache(maxsize=512, ttl=3600)         # imágenes proxy, 1h (bytes)
 _image_cache_lock = threading.Lock()
-_ue_products_cache = TTLCache(maxsize=256, ttl=600)    # productos UE por tienda, 10 min
 _cache_lock = threading.Lock()
 
 # ══════════════════════════════════════════════════════════════════════
@@ -207,17 +196,27 @@ def _check_rate_limit(ip: str, limit: int = _SEARCH_RATE_LIMIT, prefix: str = "s
 
 def _normalize_search_key(q: str, lat: float, lng: float) -> str:
     """Genera una clave de cache normalizada para la búsqueda."""
-    # Redondear coords a 3 decimales (~110m) para agrupar ubicaciones cercanas
-    return f"{q.strip().lower()}|{lat:.3f}|{lng:.3f}"
+    # Redondear coords a 2 decimales (~1 km): los resultados casi no cambian en esa distancia
+    # y así los comparten muchos más usuarios
+    return f"{q.strip().lower()}|{lat:.2f}|{lng:.2f}"
 
 # Blacklist: tiendas/farmacias/supermercados que no son restaurantes
 _STORE_BLACKLIST = _re.compile(
     r"\b(oxxo|7.?eleven|farmacia|super|soriana|ley|walmart|coppel|bodega|extra|chedraui|"
-    r"sam.?s\s*club|costco|office\s*depot|home\s*depot|liverpool|palacio\s*de\s*hierro|"
+    r"sam.?s\s*club|city\s*club|costco|office\s*depot|home\s*depot|florer|juguet|"
+    r"heb|s-mart|la\s*comer|fresko|city\s*market|calimax|merza|alsuper|waldo.?s|aurrera|"
     r"petco|pet\s*food|veterinari|ferreter|papeler|tlapal|cervecer|licorer|"
     r"conveniencia|minisuper|abarrotes|miscelanea|deposito)\b",
     _re.IGNORECASE,
 )
+
+
+_GROCERY_SECTION = _re.compile(r"s[uú]per|despensa|farmac|mascota|abarrote|conveniencia", _re.IGNORECASE)
+
+
+def _is_non_restaurant(store_name: str) -> bool:
+    """Tienda que no es restaurante: lista de exclusión, o 🛒 (así marca Uber Eats súper y tiendas)."""
+    return "🛒" in store_name or bool(_STORE_BLACKLIST.search(store_name))
 
 
 # --- Esquemas de request/response ---
@@ -227,8 +226,8 @@ class CompareRequest(BaseModel):
     ubereats_store_id: str
     rappi_product_id: str
     ubereats_product_id: str
-    lat: float = DEFAULT_LAT
-    lng: float = DEFAULT_LNG
+    lat: float
+    lng: float
     # Toppings de Rappi para simular checkout real (opcional - si no se envían, se usa el precio del menú)
     rappi_toppings: list[dict] | None = None
     # DiDi es opcional: si se omite, la respuesta solo incluye Rappi y Uber Eats
@@ -263,6 +262,14 @@ def _normalize_name(name: str) -> str:
     return " ".join(name.split())
 
 
+def _offers_first(products: list[dict]) -> list[dict]:
+    """Productos con oferta primero (mayor descuento primero); el resto conserva su orden."""
+    def discount(p: dict) -> float:
+        real = p.get("real_price") or 0
+        return 1 - p["price"] / real if real > p["price"] > 0 else 0
+    return sorted(products, key=lambda p: -discount(p))
+
+
 def _match_products(rappi_products: list, ue_products: list) -> dict:
     ue_norm = [(p, _normalize_name(p.name)) for p in ue_products]
     matched = []
@@ -281,24 +288,29 @@ def _match_products(rappi_products: list, ue_products: list) -> dict:
                 best_ratio = ratio
                 best_match = up
         if best_ratio >= 0.72 and best_match:
-            # Rechazar si los precios difieren más del 25% — evita falsos positivos por nombre similar
-            if best_match.price > 0 and rp.price > 0:
-                price_ratio = min(rp.price, best_match.price) / max(rp.price, best_match.price)
+            # Rechazar si los precios difieren más del 25% — evita falsos positivos por nombre similar.
+            # Se comparan precios sin oferta: una rebaja de Rappi no debe romper el match.
+            if best_match.real_price > 0 and rp.real_price > 0:
+                price_ratio = min(rp.real_price, best_match.real_price) / max(rp.real_price, best_match.real_price)
                 if price_ratio < 0.75:
                     continue
             matched_rappi_ids.add(rp.product_id)
             seen_ue_ids.add(best_match.product_id)
+            # Mostrar el precio más bajo entre las dos apps (con sus ofertas) y en cuál es
+            cheapest = rp if rp.price <= best_match.price else best_match
             matched.append({
                 "name": rp.name,
                 "description": rp.description,
-                "price": rp.price,
+                "price": cheapest.price,
+                "real_price": cheapest.real_price,
+                "price_platform": "rappi" if cheapest is rp else "ubereats",
                 "image_url": rp.image_url or best_match.image_url or "",
                 "rappi_product_id": rp.product_id,
                 "ubereats_product_id": best_match.product_id,
             })
 
     only_rappi = [
-        {"name": p.name, "description": p.description, "price": p.price,
+        {"name": p.name, "description": p.description, "price": p.price, "real_price": p.real_price,
          "image_url": p.image_url or "", "rappi_product_id": p.product_id, "platform": "rappi"}
         for p in rappi_products if p.product_id not in matched_rappi_ids
     ]
@@ -310,7 +322,7 @@ def _match_products(rappi_products: list, ue_products: list) -> dict:
         if p.product_id not in seen_ue_ids and p.product_id not in seen_ue_exclusive:
             seen_ue_exclusive.add(p.product_id)
             only_ubereats.append({
-                "name": p.name, "description": p.description, "price": p.price,
+                "name": p.name, "description": p.description, "price": p.price, "real_price": p.real_price,
                 "image_url": p.image_url or "", "ubereats_product_id": p.product_id, "platform": "ubereats"
             })
 
@@ -328,6 +340,16 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/status")
+def platforms_status():
+    """Si Rappi o Uber Eats están respondiendo (según las últimas respuestas reales, sin consultar)."""
+    from kupi.connectors.rappi.connector import account_health as rappi_account_health, health as rappi_health
+    from kupi.connectors.ubereats.connector import health as ue_health
+    # rappi_checkout: la sesión de la cuenta de Kupi, que solo se usa para el envío de Rappi
+    return {"rappi": rappi_health.snapshot(), "ubereats": ue_health.snapshot(),
+            "rappi_checkout": rappi_account_health.snapshot()}
+
+
 @app.get("/health/connectors")
 def health_connectors():
     """Verifica que las cookies/tokens de Rappi y UE sigan funcionando.
@@ -339,9 +361,9 @@ def health_connectors():
 @app.get("/stores/status")
 def get_stores_status(
     rappi_store_ids: str,
+    lat: float,
+    lng: float,
     ue_store_ids: str = "",
-    lat: float = DEFAULT_LAT,
-    lng: float = DEFAULT_LNG,
 ):
     """
     Verifica si cada restaurante está abierto.
@@ -350,7 +372,6 @@ def get_stores_status(
     Resultados cacheados 10 min por store.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from kupi.connectors.ubereats.connector import _call_ubereats, _build_headers, _BASE_URL
 
     rappi_ids = [sid.strip() for sid in rappi_store_ids.split(",") if sid.strip()]
     ue_ids = [sid.strip() for sid in ue_store_ids.split(",") if sid.strip()]
@@ -373,10 +394,7 @@ def get_stores_status(
 
     def check_ue(ue_store_id: str) -> bool:
         try:
-            headers = _build_headers(lat, lng)
-            body = {"storeUuid": ue_store_id, "diningMode": "DELIVERY", "time": {"asap": True}, "cbType": "EATER_ENDORSED"}
-            data = _call_ubereats(f"{_BASE_URL}/getStoreV1?localeCode=mx", headers, body).get("data", {})
-            return not data.get("closedMessage", "")
+            return not _ue_get_store(ue_store_id, lat, lng).get("closedMessage", "")
         except Exception:
             return False
 
@@ -451,207 +469,55 @@ def _is_non_food(name: str) -> bool:
     return bool(_NON_FOOD_RE.search(name.strip()))
 
 
-def _get_featured_restaurants() -> list[dict]:
-    """Carga restaurantes desde Supabase (con ambas plataformas) para featured/deals."""
-    try:
-        from kupi.catalog.restaurants import get_all
-        all_r = get_all()
-        # Solo restaurantes con ambas plataformas (para poder comparar precios)
-        return [
-            {
-                "restaurant_id": f"{r.get('rappi_store_id', '')}-{r.get('ubereats_store_id', '')}",
-                "rappi_store_id": r["rappi_store_id"],
-                "ubereats_store_id": r["ubereats_store_id"],
-                "cuisine": r.get("cuisine", ""),
-                "restaurant_name": _fix_restaurant_name(r.get("name", "")),
-            }
-            for r in all_r
-            if r.get("rappi_store_id") and r.get("ubereats_store_id")
-        ]
-    except Exception as e:
-        print(f"[featured] error cargando restaurantes de BD: {e}")
-        return []
-
-@app.get("/products/featured")
-def get_featured_products(
-    max_price: float = 100.0,
-    lat: float = DEFAULT_LAT,
-    lng: float = DEFAULT_LNG,
-):
-    """
-    Productos bajo cierto precio, verificados en Rappi y Uber Eats.
-    Corre en paralelo y cachea el resultado 5 minutos.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    with _cache_lock:
-        cached = _featured_cache_store.get("featured")
-    if cached is not None:
-        return [p for p in cached if p["price"] <= max_price]
-
-    def fetch_one(r: dict) -> list[dict]:
-        try:
-            rappi_products = rappi.fetch_menu(r["rappi_store_id"], lat, lng)
-        except Exception:
-            rappi_products = []
-        try:
-            ue_products = ubereats.fetch_menu(r["ubereats_store_id"], lat, lng)
-        except Exception:
-            ue_products = []
-
-        matched = _match_products(rappi_products, ue_products)
-        results = []
-        for p in matched["matched"]:
-            # Filtrar extras, bebidas, salsas y postres
-            if p["price"] < 45:
-                continue
-            if not p.get("image_url"):
-                continue
-            if _is_non_food(p["name"]):
-                continue
-            results.append({
-                "name": p["name"],
-                "price": p["price"],
-                "image_url": p.get("image_url", ""),
-                "restaurant_id": r["restaurant_id"],
-                "restaurant_name": r["restaurant_name"],
-                "category": r["cuisine"],
-                "rappi_product_id": p.get("rappi_product_id", ""),
-                "ubereats_product_id": p.get("ubereats_product_id", ""),
-                "rappi_store_id": r["rappi_store_id"],
-                "ubereats_store_id": r["ubereats_store_id"],
-            })
-        return results
-
-    all_products: list[dict] = []
-    with ThreadPoolExecutor(max_workers=9) as executor:
-        featured = _get_featured_restaurants()
-        futures = [executor.submit(fetch_one, r) for r in featured]
-        for future in as_completed(futures):
-            all_products.extend(future.result())
-
-    all_products.sort(key=lambda x: x["price"])
-    with _cache_lock:
-        _featured_cache_store["featured"] = all_products
-    return [p for p in all_products if p["price"] <= max_price]
+# Palabras con las que se reconoce cada categoría de /deals en el nombre del restaurante
+_CATEGORY_KEYWORDS = {
+    "pizza": ("pizza", "pizzer", "little caesars", "domino", "papa john", "hut"),
+    "pollo": ("pollo", "chicken", "kfc", "wings", "alitas", "popeyes"),
+    "sushi": ("sushi", "japon", "roll", "ramen", "teriyaki"),
+    "hamburguesas": ("burger", "hamburg", "mcdonald", "carl", "shake shack", "smash"),
+    "tacos": ("taco", "taquer", "pastor", "birria"),
+    "café": ("cafe", "café", "coffee", "starbucks", "tim hortons", "panader"),
+}
+_deals_cache = TTLStore(maxsize=1024, ttl=600)
 
 
 @app.get("/products/deals")
-def get_deals(
-    category: str,
-    max_price: float = 100.0,
-    lat: float = DEFAULT_LAT,
-    lng: float = DEFAULT_LNG,
-):
+def get_deals(category: str, lat: float, lng: float, max_price: float = 100.0):
     """
-    Productos bajo el precio TOTAL real (producto + envío + cuota de servicio)
-    verificado en Rappi y Uber Eats con checkout completo.
-    Requiere categoría. Cache 5 min por categoría.
+    Productos de la categoría por debajo de max_price en los restaurantes que entregan en la
+    zona, con las ofertas primero. Usa solo menús (en caché): el total exacto (envío + cuota)
+    se calcula al abrir el producto, no aquí, para no hacer un checkout por cada producto.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    keywords = _CATEGORY_KEYWORDS.get(category.lower(), (category.lower(),))
 
-    cache_key = f"deals_{category.lower()}_{int(max_price)}"
-    with _cache_lock:
-        cached = _featured_cache_store.get(cache_key)
-    if cached is not None:
-        return cached
+    def build() -> list[dict]:
+        restaurants = [
+            r for r in _nearby_restaurants(lat, lng)
+            if r["rappi_store_id"] and r["ubereats_store_id"]
+            and any(k in f"{r['restaurant_name']} {r['cuisine']}".lower() for k in keywords)
+        ][:8]
 
-    restaurants = [r for r in _get_featured_restaurants() if r["cuisine"].lower() == category.lower()]
-    if not restaurants:
-        return []
+        def products_of(r: dict) -> list[dict]:
+            try:
+                rappi_prods = rappi.fetch_menu(r["rappi_store_id"], lat, lng)
+            except Exception:
+                rappi_prods = []
+            try:
+                ue_prods = ubereats.fetch_menu(r["ubereats_store_id"], lat, lng)
+            except Exception:
+                ue_prods = []
+            return [
+                {**p, "restaurant_name": r["restaurant_name"], "category": category,
+                 "rappi_store_id": r["rappi_store_id"], "ubereats_store_id": r["ubereats_store_id"]}
+                for p in _match_products(rappi_prods, ue_prods)["matched"]
+                if 25 <= p["price"] <= max_price and p.get("image_url") and not _is_non_food(p["name"])
+            ]
 
-    # Paso 1: obtener menús en paralelo, conservando los objetos Product originales
-    def fetch_menus(r: dict):
-        try:
-            rappi_prods = rappi.fetch_menu(r["rappi_store_id"], lat, lng)
-        except Exception:
-            rappi_prods = []
-        try:
-            ue_prods = ubereats.fetch_menu(r["ubereats_store_id"], lat, lng)
-        except Exception:
-            ue_prods = []
-        rappi_map = {p.product_id: p for p in rappi_prods}
-        ue_map = {p.product_id: p for p in ue_prods}
-        matched = _match_products(rappi_prods, ue_prods)
-        return r, rappi_map, ue_map, matched
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            products = [p for result in ex.map(products_of, restaurants) for p in result]
+        return _offers_first(sorted(products, key=lambda p: p["price"]))[:40]
 
-    restaurant_data = []
-    with ThreadPoolExecutor(max_workers=len(restaurants)) as ex:
-        for result in as_completed([ex.submit(fetch_menus, r) for r in restaurants]):
-            restaurant_data.append(result.result())
-
-    # Paso 2: armar candidatos (filtro básico antes del checkout costoso)
-    candidates = []
-    for r, rappi_map, ue_map, matched in restaurant_data:
-        for p in matched["matched"]:
-            if p["price"] < 45 or p["price"] > max_price or not p.get("image_url"):
-                continue
-            if _is_non_food(p["name"]):
-                continue
-            rp = rappi_map.get(p.get("rappi_product_id", ""))
-            up = ue_map.get(p.get("ubereats_product_id", ""))
-            if not rp and not up:
-                continue
-            candidates.append((r, rp, up, p))
-
-    # Paso 3: checkout completo en paralelo (limitado para no saturar UberEats)
-    def full_compare(r, rp, up, p_info):
-        quotes = []
-        try:
-            if rp:
-                quotes.append(rappi.fetch_price(r["rappi_store_id"], rp, lat, lng))
-        except Exception:
-            pass
-        try:
-            if up:
-                quotes.append(ubereats.fetch_price(r["ubereats_store_id"], up, lat, lng))
-        except Exception:
-            pass
-        if not quotes:
-            return None
-        min_total = min(q.total for q in quotes)
-        if min_total > max_price:
-            return None
-        best = min(quotes, key=lambda q: q.total)
-        return {
-            "name": p_info["name"],
-            "price": p_info["price"],
-            "total": round(min_total, 2),
-            "best_platform": best.platform,
-            "image_url": p_info.get("image_url", ""),
-            "restaurant_id": r["restaurant_id"],
-            "restaurant_name": r["restaurant_name"],
-            "category": r["cuisine"],
-            "rappi_product_id": p_info.get("rappi_product_id", ""),
-            "ubereats_product_id": p_info.get("ubereats_product_id", ""),
-            "quotes": [
-                {"platform": q.platform, "total": round(q.total, 2), "delivery_fee": q.delivery_fee}
-                for q in quotes
-            ],
-        }
-
-    results = []
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futures = [ex.submit(full_compare, r, rp, up, p) for r, rp, up, p in candidates]
-        for f in as_completed(futures):
-            r = f.result()
-            if r:
-                results.append(r)
-
-    results.sort(key=lambda x: x["total"])
-    with _cache_lock:
-        _featured_cache_store[cache_key] = results
-    return results
-
-
-# Dominios permitidos para proxy de imagenes (anti-SSRF)
-_PROXY_ALLOWED_HOSTS = {
-    "images.rappi.com.mx", "images.rappi.com",
-    "cn-geo1.uber.com", "tb-static.uber.com", "www.ubereats.com",
-    "d1ralsognjng37.cloudfront.net", "duyt4h9nfnj50.cloudfront.net",
-    "d3i4yxtzktqr9n.cloudfront.net",
-    "img.uber.com",
-}
+    return _deals_cache.get_or_fetch((category.lower(), int(max_price), zone_center(lat, lng)), build)
 
 
 @app.get("/proxy/image")
@@ -708,7 +574,7 @@ def proxy_image(request: Request, url: str = Query(..., max_length=2048)):
 
 
 @app.get("/menu/rappi/{store_id}")
-def get_rappi_menu(store_id: str, lat: float = DEFAULT_LAT, lng: float = DEFAULT_LNG):
+def get_rappi_menu(store_id: str, lat: float, lng: float):
     try:
         products = rappi.fetch_menu(store_id, lat, lng)
     except Exception as e:
@@ -718,7 +584,7 @@ def get_rappi_menu(store_id: str, lat: float = DEFAULT_LAT, lng: float = DEFAULT
 
 
 @app.get("/menu/ubereats/{store_id}")
-def get_ubereats_menu(store_id: str, lat: float = DEFAULT_LAT, lng: float = DEFAULT_LNG):
+def get_ubereats_menu(store_id: str, lat: float, lng: float):
     try:
         products = ubereats.fetch_menu(store_id, lat, lng)
     except Exception as e:
@@ -761,8 +627,8 @@ def list_didi_stores():
 def get_combined_menu(
     rappi_store_id: str,
     ubereats_store_id: str,
-    lat: float = DEFAULT_LAT,
-    lng: float = DEFAULT_LNG,
+    lat: float,
+    lng: float,
     didi_store_id: str | None = None,
 ):
     """
@@ -897,8 +763,8 @@ class CompareCartRequest(BaseModel):
     rappi_store_id: str
     ubereats_store_id: str
     items: list[CartItemRequest] = Field(..., min_length=1, max_length=10)
-    lat: float = DEFAULT_LAT
-    lng: float = DEFAULT_LNG
+    lat: float
+    lng: float
 
 class CartItemResponse(BaseModel):
     product_id: str
@@ -1005,8 +871,8 @@ def compare_cart(request: Request, req: CompareCartRequest):
 def search_restaurants(
     request: Request,
     q: str = Query(..., max_length=200),
-    lat: float = Query(DEFAULT_LAT, ge=-90, le=90),
-    lng: float = Query(DEFAULT_LNG, ge=-180, le=180),
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
 ):
     """
     Búsqueda bidireccional: busca en Rappi y UberEats, cruza resultados por nombre.
@@ -1057,22 +923,14 @@ def search_restaurants(
     return merged
 
 
-def _fetch_ue_products_cached(store_id: str, lat: float, lng: float) -> list[dict]:
-    """Obtiene todos los productos de una tienda UE con cache de 10 min."""
-    cache_key = f"ue_menu_{store_id}"
-    with _cache_lock:
-        cached = _ue_products_cache.get(cache_key)
-    if cached is not None:
-        return cached
+def _fetch_ue_products(store_id: str, lat: float, lng: float) -> list[dict]:
+    """Todos los productos de una tienda UE (el conector guarda el menú en caché)."""
     try:
-        ue_products = ubereats.fetch_menu(store_id, lat, lng)
-        all_prods = [
-            {"name": p.name, "price": p.price, "image_url": p.image_url or "", "product_id": p.product_id}
-            for p in ue_products if p.price > 0
+        return [
+            {"name": p.name, "price": p.price, "real_price": p.real_price,
+             "image_url": p.image_url or "", "product_id": p.product_id}
+            for p in ubereats.fetch_menu(store_id, lat, lng) if p.price > 0
         ]
-        with _cache_lock:
-            _ue_products_cache[cache_key] = all_prods
-        return all_prods
     except Exception as e:
         print(f"[UE products] {store_id}: {e}")
         return []
@@ -1080,7 +938,7 @@ def _fetch_ue_products_cached(store_id: str, lat: float, lng: float) -> list[dic
 
 def _fetch_ue_products_for_search(store_id: str, query: str, lat: float, lng: float) -> list[dict]:
     """Busca productos en una tienda UberEats que matcheen con la query de búsqueda."""
-    all_prods = _fetch_ue_products_cached(store_id, lat, lng)
+    all_prods = _fetch_ue_products(store_id, lat, lng)
     q_lower = query.lower()
     q_words = q_lower.split()
     matching = []
@@ -1093,7 +951,7 @@ def _fetch_ue_products_for_search(store_id: str, query: str, lat: float, lng: fl
         for p in all_prods[:8]:
             if p["price"] >= 45 and p["image_url"] and not _is_non_food(p["name"]):
                 matching.append(p)
-    return matching[:6]
+    return _offers_first(matching)[:6]
 
 
 def _do_search(q: str, lat: float, lng: float) -> list[dict]:
@@ -1251,7 +1109,7 @@ def _do_search(q: str, lat: float, lng: float) -> list[dict]:
                 "delivery_fee_preview": f"${rr['shipping_cost']:.0f}" if rr["shipping_cost"] else (f"${best_ue['shipping_cost']:.0f}" if best_ue.get("shipping_cost") else ""),
                 "eta_preview": rr.get("eta", "") or best_ue.get("eta", ""),
                 "rating": str(rr.get("rating", "") or best_ue.get("rating", "")),
-                "matching_products": combined_prods[:6],
+                "matching_products": _offers_first(combined_prods)[:6],
             })
 
     # Rappi sin match (excluir nombres que son solo dirección/zona o sin productos)
@@ -1271,7 +1129,7 @@ def _do_search(q: str, lat: float, lng: float) -> list[dict]:
                 "delivery_fee_preview": f"${rr['shipping_cost']:.0f}" if rr["shipping_cost"] else "",
                 "eta_preview": rr.get("eta", ""),
                 "rating": str(rr.get("rating", "")),
-                "matching_products": rappi_prods,
+                "matching_products": _offers_first(rappi_prods),
             })
 
     # UE sin match — solo si tiene productos relevantes (evita ruido de restaurantes irrelevantes)
@@ -1291,7 +1149,7 @@ def _do_search(q: str, lat: float, lng: float) -> list[dict]:
                 "delivery_fee_preview": f"${ue['shipping_cost']:.0f}" if ue.get("shipping_cost") else "",
                 "eta_preview": ue.get("eta", ""),
                 "rating": str(ue.get("rating", "")),
-                "matching_products": ue_prods,
+                "matching_products": _offers_first(ue_prods),
             })
 
     # Intercalar: primero los que tienen ambas plataformas, luego alternar Rappi/UE
@@ -1330,14 +1188,9 @@ def _do_search(q: str, lat: float, lng: float) -> list[dict]:
     # Auto-guardar en Supabase en background (batch optimizado + subir imágenes)
     def _save_to_db():
         try:
-            import os
-            from supabase import create_client
+            from kupi.catalog.supabase_client import get_client
             from kupi.catalog.image_store import upload_image
-            url = os.environ.get("SUPABASE_URL", "")
-            key = os.environ.get("SUPABASE_SECRET_KEY", "")
-            if not url or not key:
-                return
-            sb = create_client(url, key)
+            sb = get_client()
 
             # 1. Recopilar todos los IDs para buscar en batch (2 queries en vez de N*2)
             all_rappi_ids = [r["rappi_store_id"] for r in merged if r.get("rappi_store_id")]
@@ -1458,7 +1311,6 @@ def _do_search(q: str, lat: float, lng: float) -> list[dict]:
 
 def _store_ue_open(ue_id: str, lat: float, lng: float) -> bool:
     """UberEats disponible en esta zona. Optimista ante errores de red. Cacheado."""
-    from kupi.connectors.ubereats.connector import _call_ubereats, _build_headers, _BASE_URL
     k = f"ue_open_{ue_id}_{round(lat,2)}_{round(lng,2)}"
     with _cache_lock:
         c = _status_cache.get(k)
@@ -1466,9 +1318,7 @@ def _store_ue_open(ue_id: str, lat: float, lng: float) -> bool:
         return c
     v = True
     try:
-        body = {"storeUuid": ue_id, "diningMode": "DELIVERY", "time": {"asap": True}, "cbType": "EATER_ENDORSED"}
-        data = _call_ubereats(f"{_BASE_URL}/getStoreV1?localeCode=mx", _build_headers(lat, lng), body).get("data", {})
-        v = not data.get("closedMessage", "")
+        v = not _ue_get_store(ue_id, lat, lng).get("closedMessage", "")
         with _cache_lock:
             _status_cache[k] = v
     except Exception:
@@ -1515,68 +1365,175 @@ def _store_available(rappi_id, ue_id, lat: float, lng: float) -> bool:
     return True
 
 
-@app.get("/restaurants/popular")
-def get_popular_restaurants(
-    lat: float = DEFAULT_LAT,
-    lng: float = DEFAULT_LNG,
-):
+_BRAND_NOISE = _re.compile(r"\(.*?\)|\b(turbo|express|delivery|mx|cdmx)\b")
+
+
+def _brand_key(name: str) -> str:
+    """Marca normalizada para cruzar tiendas entre apps ("Carl's Jr. - Turbo" → "carl s jr")."""
+    return " ".join(_BRAND_NOISE.sub(" ", _normalize_name(name)).split())
+
+
+def _same_brand(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if a == b or b.startswith(a + " ") or a.startswith(b + " "):
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.88
+
+
+_nearby_cache = TTLStore(maxsize=4096, ttl=300, stale_ttl=3600)
+
+
+def _nearby_restaurants(lat: float, lng: float) -> list[dict]:
     """
-    Restaurantes populares desde Supabase con status abierto/cerrado en tiempo real.
-    Prioriza restaurantes con ambas plataformas e imagen.
-    Con ambas apps, solo se marca disponible si AMBAS lo están. Cache de 5 min.
+    Restaurantes que entregan en la zona, de las dos apps, enlazados entre sí.
+    Sale de los feeds de inicio de Rappi y Uber Eats (una petición por app y zona cada
+    20 min, compartida con las ofertas). Enlace: primero el catálogo (Supabase); lo que
+    falte, por marca. Los enlaces nuevos se guardan en el catálogo para las siguientes veces.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    def build() -> list[dict]:
+        from kupi.catalog.restaurants import lookup_by_rappi_ids, lookup_by_ue_ids
 
-    # Cache por ubicación (redondeada a 1 decimal ~11km) para no servir Culiacán a alguien en Veracruz
-    cache_key = f"popular_{round(lat,1)}_{round(lng,1)}"
-    with _cache_lock:
-        cached = _popular_cache_store.get(cache_key)
-    if cached is not None:
-        return cached
-
-    try:
-        from kupi.catalog.restaurants import get_all
-        all_restaurants = get_all()
-    except Exception as e:
-        print(f"[popular] error cargando BD: {e}")
-        all_restaurants = []
-
-    if not all_restaurants:
-        return []
-
-    # Filtrar blacklist y priorizar: ambas plataformas + imagen primero
-    filtered = [r for r in all_restaurants if not _STORE_BLACKLIST.search(r.get("name", ""))]
-    filtered.sort(key=lambda r: (
-        0 if (r.get("rappi_store_id") and r.get("ubereats_store_id") and r.get("image_url")) else 1,
-        0 if (r.get("rappi_store_id") and r.get("ubereats_store_id")) else 1,
-    ))
-    candidates = filtered[:50]  # Limitar para no saturar APIs
-
-    def check_status(r: dict) -> dict:
-        is_open = _store_available(r.get("rappi_store_id"), r.get("ubereats_store_id"), lat, lng)
-        return {
-            "restaurant_name": _fix_restaurant_name(r.get("name", "")),
-            "rappi_store_id": r.get("rappi_store_id"),
-            "ubereats_store_id": r.get("ubereats_store_id"),
-            "image_url": r.get("image_url", ""),
-            "cuisine": r.get("cuisine", ""),
-            "is_open": is_open,
-        }
-
-    results = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(check_status, r) for r in candidates]
-        for f in as_completed(futures):
+        def safe(fn):
             try:
-                results.append(f.result())
-            except Exception:
-                pass
+                return fn(lat, lng)
+            except Exception as e:
+                print(f"[nearby] {fn.__module__}: {e}")
+                return []
 
-    # Abiertos primero, luego cerrados
-    results.sort(key=lambda r: (0 if r["is_open"] else 1, r["restaurant_name"]))
-    with _cache_lock:
-        _popular_cache_store[cache_key] = results
-    return results
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            ue_future, rappi_future = ex.submit(safe, ue_nearby_stores), ex.submit(safe, rappi_nearby_stores)
+            ue_stores = [s for s in ue_future.result() if not _is_non_restaurant(s["store_name"])]
+            rappi_stores = [s for s in rappi_future.result() if not _is_non_restaurant(s["brand_name"])]
+
+        try:
+            by_ue = lookup_by_ue_ids([s["store_id"] for s in ue_stores])
+            by_rappi = lookup_by_rappi_ids([s["store_id"] for s in rappi_stores])
+        except Exception as e:
+            print(f"[nearby] catálogo: {e}")
+            by_ue, by_rappi = {}, {}
+
+        rappi_by_id = {s["store_id"]: s for s in rappi_stores}
+        linked_rappi: set[str] = set()
+        new_links: list[dict] = []
+        results = []
+        for ue in ue_stores:
+            rappi_id = (by_ue.get(ue["store_id"]) or {}).get("rappi_store_id")
+            if not rappi_id:
+                key = _brand_key(ue["store_name"])
+                match = next((r for r in rappi_stores if r["store_id"] not in linked_rappi
+                              and not by_rappi.get(r["store_id"]) and _same_brand(_brand_key(r["brand_name"]), key)), None)
+                if match:
+                    rappi_id = match["store_id"]
+                    new_links.append({"name": ue["store_name"], "rappi_store_id": rappi_id,
+                                      "ubereats_store_id": ue["store_id"], "image_url": ue["image_url"]})
+            if rappi_id:
+                linked_rappi.add(rappi_id)
+            results.append({
+                "restaurant_name": _fix_restaurant_name(ue["store_name"]),
+                "rappi_store_id": rappi_id,
+                "ubereats_store_id": ue["store_id"],
+                "image_url": ue["image_url"] or (rappi_by_id.get(rappi_id) or {}).get("image_url", ""),
+                "cuisine": (by_ue.get(ue["store_id"]) or {}).get("cuisine", ""),
+                "offer": ue.get("offer", ""),
+                "is_open": True,  # los feeds solo traen tiendas que entregan ahora en la zona
+            })
+        for r in rappi_stores:
+            if r["store_id"] in linked_rappi:
+                continue
+            ue_id = (by_rappi.get(r["store_id"]) or {}).get("ubereats_store_id")
+            results.append({
+                "restaurant_name": _fix_restaurant_name(r["brand_name"]),
+                "rappi_store_id": r["store_id"],
+                "ubereats_store_id": ue_id,
+                "image_url": r["image_url"],
+                "cuisine": (by_rappi.get(r["store_id"]) or {}).get("cuisine", ""),
+                "offer": "",
+                "is_open": True,
+            })
+
+        if new_links:
+            threading.Thread(target=_save_links, args=(new_links,), daemon=True).start()
+        # Primero los que están en las dos apps (se pueden comparar)
+        results.sort(key=lambda r: 0 if (r["rappi_store_id"] and r["ubereats_store_id"]) else 1)
+        return results
+
+    return _nearby_cache.get_or_fetch(zone_center(lat, lng), build)
+
+
+def _save_links(links: list[dict]) -> None:
+    from kupi.catalog.restaurants import upsert_restaurant
+    for link in links:
+        try:
+            upsert_restaurant(**link, match_confidence="auto_brand")
+        except Exception as e:
+            print(f"[nearby] no se guardó el enlace {link['name']}: {e}")
+            return
+
+
+@app.get("/restaurants/popular")
+def get_popular_restaurants(lat: float, lng: float):
+    """Restaurantes que entregan en la zona del usuario, de las dos apps (ver _nearby_restaurants)."""
+    return _nearby_restaurants(lat, lng)
+
+
+@app.get("/offers")
+def get_offers(request: Request, lat: float, lng: float):
+    """
+    Secciones de ofertas de Rappi (productos) y Uber Eats (tiendas) en la zona del usuario.
+    Cada conector hace una sola petición por zona y la guarda 20 min. Cada oferta se enlaza
+    con la misma tienda en la otra app usando el catálogo (Supabase), para poder comparar.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip, _GENERAL_RATE_LIMIT, "offers")
+
+    from kupi.catalog.restaurants import lookup_by_rappi_ids, lookup_by_ue_ids
+
+    def safe(fn):
+        try:
+            return fn(lat, lng)
+        except Exception as e:
+            print(f"[offers] {fn.__module__}: {e}")
+            return []
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        rappi_future = ex.submit(safe, rappi_offer_sections)
+        ue_future = ex.submit(safe, ue_offer_sections)
+        rappi_sections, ue_sections = rappi_future.result(), ue_future.result()
+
+    # Enlaces con la otra app: restaurantes cercanos ya cruzados y, para el resto, el catálogo
+    ue_of_rappi: dict[str, str] = {}
+    rappi_of_ue: dict[str, str] = {}
+    for r in _nearby_restaurants(lat, lng):
+        if r["rappi_store_id"] and r["ubereats_store_id"]:
+            ue_of_rappi[r["rappi_store_id"]] = r["ubereats_store_id"]
+            rappi_of_ue[r["ubereats_store_id"]] = r["rappi_store_id"]
+    try:
+        missing_rappi = list({i["store_id"] for s in rappi_sections for i in s["items"]} - ue_of_rappi.keys())
+        missing_ue = list({i["store_id"] for s in ue_sections for i in s["items"]} - rappi_of_ue.keys())
+        ue_of_rappi.update({k: v["ubereats_store_id"] for k, v in lookup_by_rappi_ids(missing_rappi).items()})
+        rappi_of_ue.update({k: v["rappi_store_id"] for k, v in lookup_by_ue_ids(missing_ue).items()})
+    except Exception as e:
+        print(f"[offers] catálogo: {e}")
+
+    # Solo restaurantes: Uber Eats mezcla súper y tiendas de conveniencia en sus carruseles
+    ue_sections = [
+        {**s, "items": [i for i in s["items"] if not _is_non_restaurant(i["store_name"])]}
+        for s in ue_sections
+    ]
+    ue_sections = [s for s in ue_sections if len(s["items"]) >= 3 and not _GROCERY_SECTION.search(s["title"])]
+
+    # Copias: las secciones vienen de la caché de los conectores
+    sections = [
+        {**s, "items": [{**i, "rappi_store_id": i["store_id"], "ubereats_store_id": ue_of_rappi.get(i["store_id"])}
+                        for i in s["items"]]}
+        for s in rappi_sections
+    ] + [
+        {**s, "items": [{**i, "ubereats_store_id": i["store_id"], "rappi_store_id": rappi_of_ue.get(i["store_id"])}
+                        for i in s["items"]]}
+        for s in ue_sections
+    ]
+    return {"sections": sections}
 
 
 @app.get("/coupons")
@@ -1596,8 +1553,8 @@ def get_coupons_endpoint(restaurant_id: str | None = None):
 @app.post("/coupons/refresh")
 def refresh_coupons_endpoint(
     request: Request,
-    lat: float = DEFAULT_LAT,
-    lng: float = DEFAULT_LNG,
+    lat: float,
+    lng: float,
 ):
     """
     Escanea Rappi y UberEats en tiempo real y actualiza la tabla de cupones en Supabase.
